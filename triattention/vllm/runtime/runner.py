@@ -50,13 +50,37 @@ class TriAttentionModelRunner:
         self._logger = logging.getLogger(__name__)
         self._perf = TriAttentionPerfProfile.from_env(self._logger)
         self._pending_compression_events: list[dict[str, Any]] = []
-        self._strict_no_downgrade = bool(self.config.enable_experimental_kv_compaction)
+        # Strict mode (the `TRIATTN_FATAL_TRITON_SCORING_REQUIRED` contract)
+        # is the OR of two configuration switches:
+        # 1. `require_triton_scoring` — explicit env-var opt-in (default True,
+        #    set by `_bridge_legacy_env_to_runtime`); this is the canonical
+        #    knob users reach for in production to detect scoring regressions.
+        # 2. `enable_experimental_kv_compaction` — the upstream "real
+        #    compaction is on" signal; if compaction is off there is no
+        #    point in the strict check anyway.
+        # We previously conflated the two (took only #2); honor both so
+        # users can disable strict mode cleanly via `REQUIRE_TRITON_SCORING=0`
+        # without also turning off compaction.
+        self._strict_no_downgrade = bool(
+            self.config.require_triton_scoring
+            and self.config.enable_experimental_kv_compaction
+        )
         self._runtime_input_patch_installed = False
         self._allowed_strict_skip_reasons = {
             "under_budget",
             "prefill_exceeds_budget",
             "req_state_not_found",
             "batch_queue_dedup",
+            # The signal triggered (threshold/length check passed) but the
+            # group-compaction step found no group that had a non-empty
+            # keep-set (e.g. because cache_len is between threshold and
+            # `num_kv_heads * block_size`, where per-head topk can only
+            # return ≤ 1 token per head, and the layout engine treats that
+            # as a no-op).  This is a legitimate "nothing to compact this
+            # step" outcome, not a Triton/scoring failure — strict mode
+            # should NOT crash the worker for it.  Discovered via
+            # issue #1 on sunao2000123/my-triattention.
+            "no_compactable_groups",
         }
 
     def __getattr__(self, name: str) -> Any:

@@ -116,6 +116,39 @@ def execute_runner_compression_actions(
             and not result.applied
             and result.reason not in allowed_strict_skip_reasons
         ):
+            # Emit a `skipped` event so the scheduler side
+            # (`update_from_output`) can observe the failed attempt and
+            # update its effective-length / dedup counters consistently.
+            # Without this, the strict-mode raise below would crash the
+            # worker but leave the scheduler with stale state (no
+            # `triattention_compression_events` payload for this req_id),
+            # causing the next scheduling round to re-emit a signal for
+            # the same step and cascade-fail.
+            #
+            # NOTE: this only fires for *unexpected* skip reasons, i.e.
+            # the strict-skip contract is genuinely violated.  The
+            # expected, allow-listed skip reasons (under_budget,
+            # no_compactable_groups, etc.) fall through to the normal
+            # `state_store.mark_compression_skipped` + `events.append`
+            # path below — they do NOT trigger this raise.
+            events.append(
+                {
+                    "req_id": req_id,
+                    "step": signal.step,
+                    "status": "skipped",
+                    "reason": f"strict_unexpected_skip:{result.reason}",
+                    "cache_len_after": result.cache_len_after,
+                    "details": result.details,
+                    "scheduled_tokens": int(getattr(signal, "scheduled_tokens", 1)),
+                    "estimated_cache_len": int(getattr(signal, "estimated_cache_len", 0)),
+                    "prefill_len": int(getattr(signal, "prefill_len", 0)),
+                    "block_reclaim": (
+                        result.details.get("block_reclaim")
+                        if isinstance(result.details, dict)
+                        else None
+                    ),
+                }
+            )
             raise RuntimeError(
                 f"{TRITON_SCORING_REQUIRED_MARKER}:unexpected_skip:"
                 f"req={req_id}:step={signal.step}:reason={result.reason}"

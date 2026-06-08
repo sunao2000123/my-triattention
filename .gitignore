@@ -27,7 +27,11 @@ dist/
 .venv/
 venv/
 env/
+
+# Local secrets (GitHub PAT, etc.) — never commit
 .env
+.env.*
+!.env.example
 
 # Cache / runtime
 .pytest_cache/
