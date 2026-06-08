@@ -1,0 +1,62 @@
+# TriAttention multi-prompt demo config
+# Runs LongLive's interactive inference pipeline (multi-prompt with switches)
+# with TriAttention's 50% KV cache compression.
+#
+# To run:
+#   python -m longlive.run_interactive --config_path longlive/configs/triattention_interactive.yaml
+
+# Architecture (matches LongLive's official longlive_interactive_inference.yaml)
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+
+model_kwargs:
+  # Local attention (LongLive local-attention window with a single sink frame
+  # — matches the setting used for the TriAttention demo video).
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 1
+
+  # TriAttention KV compression (this file's headline feature)
+  kv_compression_mode: compress
+  kv_stats_path: longlive/assets/calibration_stats_81f.pt
+  kv_budget_tokens: 9360           # 50% of local-attention window (12 * 1560 = 18720 tokens)
+  kv_compress_every_n_frames: 3
+  kv_keep_last_frames: 3
+  kv_pruning_mode: layer_perhead
+  kv_score_aggregation: mean
+  kv_perhead_layer_aggregation: mean_of_layer_max
+  kv_offset_max_frames: 128
+  kv_normalize_scores: true
+  kv_tie_break_noise: true
+  kv_tie_break_noise_scale: 1.0e-6
+  kv_random_seed: 0
+
+# Inference (matches LongLive's interactive_inference config)
+data_path: longlive_models/prompts/interactive_example.jsonl
+output_folder: videos/triattention_interactive
+inference_iter: -1
+num_output_frames: 240
+use_ema: false
+seed: 1
+num_samples: 1
+save_with_index: true
+switch_frame_indices: 40, 80, 120, 160, 200
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+lora_ckpt: longlive_models/models/lora.pt
+
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false

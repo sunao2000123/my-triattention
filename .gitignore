@@ -1,0 +1,66 @@
+# Exclude the two vllm source repos (read-only references for code
+# comparison; not part of the TriAttention-Ascend deliverable).
+vllm-releases-v0.18.0/
+vllm-ascend-releases-v0.18.0/
+
+# OS / IDE noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+.env
+
+# Cache / runtime
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
+
+# Logs
+*.log
+*.log.*
+logs/
+
+# Triton / CANN caches
+.triton/
+.triton_cache/
+
+# NPU profiling
+npu-smi*.log
+cann-*.log
+
+# Large data / datasets (we keep .pt calibration stats; exclude
+# raw corpora and pre-tokenized datasets).
+data/raw/
+data/processed/
+*.bin
+*.safetensors
+*.gguf
+huggingface/
+
+# Local model caches
+.cache/
+models/
+checkpoints/
