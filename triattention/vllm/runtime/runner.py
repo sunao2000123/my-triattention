@@ -432,6 +432,9 @@ class TriAttentionModelRunner:
         #   what the step number on scheduler_output is
         # If this line is missing entirely, the proxy is not in the
         # call chain at all.
+        # Use print() to sys.stderr in addition to logger.info so
+        # the line surfaces even if vllm's logger config silences
+        # INFO in the worker subprocess.
         if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
             try:
                 _sig_dict = getattr(scheduler_output, "triattention_signals", None) or {}
@@ -443,10 +446,17 @@ class TriAttentionModelRunner:
                 )
                 _n_new = len(getattr(scheduler_output, "scheduled_new_reqs", []) or [])
                 _step = getattr(scheduler_output, "triattention_step", None)
+                _line = (
+                    f"[TRITN-INSTR] A:execute_model step={_step} signals={_n_sig} "
+                    f"will_compress={_n_press} new_reqs={_n_new}\n"
+                )
                 _logger.info(
                     "[TRITN-INSTR] A:execute_model step=%s signals=%d will_compress=%d new_reqs=%d",
                     _step, _n_sig, _n_press, _n_new,
                 )
+                import sys as _sys_a
+                _sys_a.stderr.write(_line)
+                _sys_a.stderr.flush()
             except Exception:
                 pass
         perf_enabled = bool(getattr(self._perf, "enabled", False))
