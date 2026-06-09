@@ -298,9 +298,12 @@ class TriAttentionModelRunner:
                     TriAttentionModelRunner._cumulative_skipped,
                 )
                 import sys as _sys_c2
+                # Cap reasons to first 10 unique to avoid log flood;
+                # the cumulative counter already gives us the total.
+                _reasons_str = ",".join(list(_reasons)[:10])
                 _sys_c2.stderr.write(
                     f"[TRITN-INSTR] C2:compress_done events={len(_evs)} "
-                    f"applied={_applied} skipped={_skipped} "
+                    f"applied={_applied} skipped={_skipped} reasons=[{_reasons_str}] "
                     f"cumulative_applied={TriAttentionModelRunner._cumulative_applied} "
                     f"cumulative_skipped={TriAttentionModelRunner._cumulative_skipped}\n"
                 )

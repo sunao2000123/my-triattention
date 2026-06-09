@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +96,6 @@ def register_triattention_backend():
     # Allow baseline mode: skip all integration when explicitly disabled.
     if not _truthy(os.environ.get("ENABLE_TRIATTENTION"), default=True):
         return
-
-    # Lazy import: keep this top-level import free so cold-start cost is
-    # only paid when the plugin is actually invoked.
-    import sys
 
     quiet = os.environ.get("TRIATTENTION_QUIET", "0") == "1"
     interface_mode = os.environ.get("TRIATTENTION_INTERFACE", "runtime").strip().lower()

@@ -48,10 +48,8 @@ import os
 from concurrent.futures import Future
 from typing import Any, Callable, cast
 
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.v1.outputs import ModelRunnerOutput
-
-logger = init_logger(__name__)
 
 
 # --- INSTRUMENTATION: process-wide cumulative counters ---

@@ -84,6 +84,18 @@ def execute_runner_compression_actions(
                         getattr(result, "reason", None),
                         getattr(result, "cache_len_after", None),
                     )
+                    # Also emit to stderr so we see it regardless of
+                    # vllm logger config. Cap at 200 chars to keep
+                    # tail -F readable.
+                    import sys as _sys_c
+                    _reason = getattr(result, "reason", None) or "?"
+                    _sys_c.stderr.write(
+                        f"[TRITN-INSTR] C:executor_result req={req_id} "
+                        f"applied={getattr(result, 'applied', None)} "
+                        f"reason={str(_reason)[:200]} "
+                        f"cache_len_after={getattr(result, 'cache_len_after', None)}\n"
+                    )
+                    _sys_c.stderr.flush()
                 except Exception:
                     pass
         except Exception as exc:  # pragma: no cover - safety fallback
