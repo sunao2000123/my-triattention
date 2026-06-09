@@ -155,6 +155,34 @@ def build_triattention_selector(
     compressor = TriAttentionCompressor(tri_cfg)
     available_layers_sorted: tuple[int, ...] | None = None
     available_layers_set: set[int] | None = None
+
+    def _resolve_runtime_heads(kv_cache: torch.Tensor) -> int:
+        """Resolve the per-layer ``num_kv_heads`` from a kv cache tensor.
+
+        CUDA 5D layout:
+          ``[2, num_blocks, block_size, H, D]`` -> ``H`` is ``shape[3]``
+          ``[num_blocks, 2, block_size, H, D]`` -> ``H`` is ``shape[3]``
+
+        Ascend (vllm-ascend v0.18.0) 4D layout:
+          ``[num_blocks, block_size, H, D]`` -> ``H`` is ``shape[2]``
+
+        The previous code hard-assumed ``shape[3]`` which is the
+        head_dim on the Ascend 4D layout, causing ``runtime_heads``
+        to be 128/256/etc instead of e.g. 8, which downstream
+        triggers ``repeat_interleave(group_size=0)`` and a
+        ``TypeError`` that gets re-wrapped into
+        ``TRIATTN_FATAL_TRITON_SCORING_REQUIRED``.
+        """
+        if kv_cache.ndim == 4:
+            # Ascend: [num_blocks, block_size, H, D]
+            return int(kv_cache.shape[2])
+        if kv_cache.ndim == 5:
+            # CUDA: K/V split on dim0 or dim1; heads always on dim3
+            return int(kv_cache.shape[3])
+        raise RuntimeError(
+            f"unsupported_kv_cache_layout_for_head_resolve:ndim={kv_cache.ndim}"
+        )
+
     def _resolve_effective_recent_count(total_tokens: int) -> int:
         if total_tokens <= 0 or config.window_size <= 0:
             return 0
@@ -360,8 +388,54 @@ def build_triattention_selector(
                 trig_cache=getattr(compressor, "trig_cache", None),
             )
         except Exception as exc:
+            # --- TRANSPARENT TRITON->PYTORCH FALLBACK (NPU) ---
+            # On vllm-ascend v0.18.0 the triton-ascend backend does NOT
+            # fully support ``tl.static_range(num_offsets > 1)`` inside
+            # ``triattention_scoring_kernel`` and may raise ``TypeError``
+            # at JIT compile time. The PyTorch implementation in
+            # ``compute_scores_pytorch`` is mathematically equivalent
+            # (same R-KV formula, same freq/RoPE math), so when we are
+            # running on a non-CUDA compute device we transparently
+            # fall back. The downstream ``require_triton_scoring`` flag
+            # in ``runner_compression_actions`` will not trigger a
+            # ``TRIATTN_FATAL_TRITON_SCORING_REQUIRED`` because we are
+            # intentionally downgrading only this single call and the
+            # algorithm still produces a valid keep-set.
+            _is_npu = (
+                effective_device.type == "npu"
+                or os.environ.get("TRIATTN_ASCEND_TRANSPARENT_TRITON_FALLBACK", "1")
+                == "1"
+                and effective_device.type != "cuda"
+            )
+            if _is_npu:
+                try:
+                    from triattention.vllm.core.scoring import compute_scores_pytorch
+                    _scores = compute_scores_pytorch(
+                        key_states=score_inputs,
+                        cache_positions=None,
+                        head_stats=score_head_stats,
+                        omega=compressor.omega,
+                        offsets=compressor.offsets,
+                        freq_scale_sq=score_freq_scale_sq,
+                        config=tri_cfg,
+                        round_start=round_start,
+                    )
+                    logger.warning(
+                        "[TriAttention] transparent Triton->PyTorch fallback on "
+                        "device=%s: %s: %s",
+                        effective_device,
+                        type(exc).__name__,
+                        str(exc)[:160],
+                    )
+                    return _scores
+                except Exception as exc2:
+                    raise RuntimeError(
+                        f"{TRITON_SCORING_REQUIRED_MARKER}:score_failed_after_fallback:"
+                        f"{type(exc).__name__}->{type(exc2).__name__}:{str(exc2)[:120]}"
+                    ) from exc2
             raise RuntimeError(
                 f"{TRITON_SCORING_REQUIRED_MARKER}:score_failed:{type(exc).__name__}"
+                f":{str(exc)[:160]}"
             ) from exc
 
     def _finalize_layer_scores(
@@ -409,7 +483,7 @@ def build_triattention_selector(
         prefill_len: int,
         protect_prefill: bool,
     ) -> torch.Tensor:
-        runtime_heads = int(kv_cache.shape[3])
+        runtime_heads = _resolve_runtime_heads(kv_cache)
         (
             score_head_stats,
             score_freq_scale_sq,
@@ -519,7 +593,7 @@ def build_triattention_selector(
         round_start: int,
         budget_total: int,
     ) -> dict[str, Any]:
-        runtime_heads = int(kv_cache.shape[3])
+        runtime_heads = _resolve_runtime_heads(kv_cache)
         (
             score_head_stats,
             score_freq_scale_sq,
@@ -854,7 +928,8 @@ def build_triattention_selector(
             elif layer_kv_iter is not None:
                 first_item = next(iter(layer_kv_iter()), None)
                 if first_item is not None:
-                    head_count = int(first_item[1].shape[3])
+                    # 4D Ascend vs 5D CUDA — use the layout-aware helper
+                    head_count = _resolve_runtime_heads(first_item[1])
             if head_count <= 0:
                 return {"mode": "per_head", "indices": []}
             all_indices = torch.arange(
@@ -903,7 +978,7 @@ def build_triattention_selector(
                 return {"mode": "per_head", "indices": []}
             prepared_layers: list[dict[str, Any]] = []
             for layer_idx, kv_cache, block_ids, layer_block_size in layer_entries:
-                runtime_heads = int(kv_cache.shape[3])
+                runtime_heads = _resolve_runtime_heads(kv_cache)
                 (
                     score_head_stats,
                     score_freq_scale_sq,

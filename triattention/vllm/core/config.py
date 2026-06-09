@@ -82,8 +82,18 @@ class TriAttentionConfig:
     """Data type for position_indices storage (int32 recommended, bf16 also supported)."""
 
     # ===== Device Configuration =====
-    device: torch.device = field(default_factory=lambda: torch.device("cuda"))
-    """Device for computation (default: CUDA)."""
+    device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    """Device for computation.
+
+    Default is CPU to avoid silently loading frequency stats onto a CUDA
+    device that is not actually the runtime compute device (e.g. on
+    vllm-ascend v0.18.0 where ``torch.device("cuda")`` is not a valid
+    NPU device and would crash ``load_frequency_stats`` with a
+    NotImplementedError before the first compress call).
+
+    The real device is always resolved at runtime from the live
+    ``base_runner.device`` attribute by ``selector_hf.py``.
+    """
 
     # ===== Triton Kernel Parameters =====
     triton_block_size: int = 128

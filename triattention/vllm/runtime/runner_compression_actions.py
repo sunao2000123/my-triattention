@@ -106,9 +106,18 @@ def execute_runner_compression_actions(
                     req_id,
                     signal.step,
                 )
+                # Preserve the original TypeError message + exception chain
+                # so the vllm-ascend engineer can immediately see whether
+                # the failure was a Triton kernel compile error,
+                # a kv_cache layout mismatch, or a runtime problem.
+                _root = exc.__cause__ if exc.__cause__ is not None else exc
+                _root_type = type(_root).__name__
+                _root_msg = str(_root).strip()
                 raise RuntimeError(
                     f"{TRITON_SCORING_REQUIRED_MARKER}:executor_exception:"
-                    f"req={req_id}:step={signal.step}:type={type(exc).__name__}"
+                    f"req={req_id}:step={signal.step}:"
+                    f"type={type(exc).__name__}:"
+                    f"root_cause={_root_type}:{_root_msg[:200]}"
                 ) from exc
             if TRITON_SCORING_REQUIRED_MARKER in str(exc):
                 logger.exception(

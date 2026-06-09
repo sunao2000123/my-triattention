@@ -92,9 +92,28 @@ def build_keep_token_indices(
 
 
 def _split_kv_axes(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return key/value views in shape [num_blocks, block_size, H, D]."""
+    """Return key/value views in shape ``[num_blocks, block_size, H, D]``.
+
+    Supports three layouts:
+
+    1. ``[2, num_blocks, block_size, H, D]`` (FlashAttention-style, K/V on dim 0)
+    2. ``[num_blocks, 2, block_size, H, D]`` (TritonAttention-style, K/V on dim 1)
+    3. ``[num_blocks, block_size, H, D]`` (Ascend 4D — vllm-ascend v0.18.0
+       ``NPUModelRunner`` does not pre-split K/V, so we receive a single
+       4D tensor. We treat it as a key-only view; the value mirror is
+       expected to be handled by the same compact routine on the
+       parallel value cache. The selector hot path uses 4D tensors
+       directly without ever splitting K/V.)
+    """
+    if kv_cache.ndim == 4:
+        # Ascend 4D layout — K and V live in parallel 4D tensors, but
+        # for the purpose of compaction we treat the input as the key
+        # view. The matching value view is passed separately.
+        return kv_cache, kv_cache
     if kv_cache.ndim != 5:
-        raise ValueError(f"Unsupported kv_cache ndim={kv_cache.ndim}, expect 5")
+        raise ValueError(
+            f"Unsupported kv_cache ndim={kv_cache.ndim}, expect 4 or 5"
+        )
     dim0_is_kv = int(kv_cache.shape[0]) == 2
     dim1_is_kv = int(kv_cache.shape[1]) == 2
 

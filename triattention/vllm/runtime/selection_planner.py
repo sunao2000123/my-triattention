@@ -175,9 +175,18 @@ def prepare_group_layer_compactions(
                     budget_total=group_budget_total,
                 )
         except Exception as exc:
+            # Preserve the original TypeError message so future debugging on
+            # vllm-ascend v0.18.0 can immediately tell whether the failure
+            # was a kv_cache axis mismatch, a Triton kernel compile error,
+            # or a downstream runtime problem. The marker stays unchanged
+            # for log greppability; the underlying cause is appended.
+            _root = exc.__cause__ if exc.__cause__ is not None else exc
+            _root_msg = str(_root).strip()
+            _root_type = type(_root).__name__
             raise RuntimeError(
                 f"{TRITON_SCORING_REQUIRED_MARKER}:"
-                f"req={req_id}:gid={gid}:global_per_head:{type(exc).__name__}"
+                f"req={req_id}:gid={gid}:global_per_head:{type(exc).__name__}:"
+                f"root_cause={_root_type}:{_root_msg[:160]}"
             ) from exc
 
     for layer_idx, kv_cache in layer_tensors:

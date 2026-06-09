@@ -108,6 +108,53 @@ def _bridge_legacy_env_to_runtime() -> None:
                 mode = "per_layer_per_head"
             os.environ["TRIATTN_RUNTIME_PRUNING_MODE"] = mode
 
+    # --- NPU SAFETY OVERRIDES ---
+    # On vllm-ascend v0.18.0:
+    #   1. The global per-head selector path inside
+    #      ``selector_hf._select_keep_indices_for_group_per_head`` calls
+    #      ``compute_scores_triton`` whose Triton kernel uses
+    #      ``tl.static_range(num_offsets)``. The triton-ascend backend
+    #      (CANN) does not fully support ``num_offsets > 1`` in
+    #      ``tl.static_range`` and emits ``TypeError`` at JIT compile
+    #      time. The selector_hf path now has a transparent
+    #      Triton->PyTorch fallback, but the cleanest safety net on
+    #      Ascend is to default the pruning mode to ``per_layer``
+    #      (single-pass, no static_range) unless the user explicitly
+    #      opts into per_head semantics.
+    #
+    #   2. The kv_cache layout on NPU is 4D
+    #      ``[num_blocks, block_size, H, D]`` whereas CUDA is 5D with a
+    #      K/V split axis. The selector helper has been patched to
+    #      accept both layouts, but a fresh deploy with default
+    #      ``per_head`` + ``hf_aligned_global_per_head`` is the most
+    #      common source of the historic
+    #      ``TRIATTN_FATAL_TRITON_SCORING_REQUIRED:...:global_per_head:TypeError``
+    #      failure. We default to ``per_layer`` so first-time deploys
+    #      do not silently trip this.
+    #
+    # Users may opt back into the legacy per_head behavior by
+    # explicitly exporting either of:
+    #   TRIATTN_ASCEND_FORCE_PER_LAYER=0
+    #   TRIATTN_RUNTIME_PRUNING_MODE=per_head
+    _force_per_layer = _truthy(
+        os.environ.get("TRIATTN_ASCEND_FORCE_PER_LAYER"),
+        default=True,
+    )
+    _explicit_user_pruning = (
+        os.environ.get("TRIATTN_RUNTIME_PRUNING_MODE")
+        or os.environ.get("TRIATTENTION_PRUNING_MODE")
+    )
+    if (
+        _force_per_layer
+        and not _explicit_user_pruning
+    ):
+        os.environ["TRIATTN_RUNTIME_PRUNING_MODE"] = "per_layer"
+        os.environ["TRIATTN_RUNTIME_ALLOW_PER_LAYER_MODE"] = "true"
+        os.environ.setdefault(
+            "TRIATTN_ASCEND_DEFAULT_PRUNING_MODE_OVERRIDE",
+            "per_layer",
+        )
+
 
 def register_triattention_backend():
     """TriAttention Ascend-side plugin entry point.
