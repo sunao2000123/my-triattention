@@ -54,6 +54,15 @@ from vllm.v1.outputs import ModelRunnerOutput
 logger = init_logger(__name__)
 
 
+# --- INSTRUMENTATION: process-wide cumulative counters ---
+# Updated by W:worker_execute on every NPUWorker.execute_model call.
+# Used to report the lifetime signal/should_compress counts even when
+# the per-step logger is rate-limited or noisy.
+_W_CUM_STEPS: int = 0
+_W_CUM_SIGNALS_TOTAL: int = 0
+_W_CUM_WILL_COMPRESS: int = 0
+
+
 # Re-exports of platform-agnostic helpers. The implementation lives in
 # `triattention.vllm.runtime.*` (CUDA-shared) so the algorithm stays
 # in one place.
@@ -415,11 +424,26 @@ def _patched_npu_worker_execute_model(self, scheduler_output):
                 getattr(self, "_triattention_runner_proxy_installed", False)
             )
             _runner_class = type(getattr(self, "model_runner", None)).__name__
+            # Update process-wide cumulative counters. These survive
+            # the W:worker_execute being rate-limited and let us see
+            # the LIFETIME totals on every log line.
+            global _W_CUM_STEPS, _W_CUM_SIGNALS_TOTAL, _W_CUM_WILL_COMPRESS
+            _W_CUM_STEPS += 1
+            _W_CUM_SIGNALS_TOTAL += _n_total
+            _W_CUM_WILL_COMPRESS += _n_press
             logger.info(
                 "[TRITN-INSTR] W:worker_execute step=%s signals=%d will_compress=%d "
-                "proxy_installed=%s model_runner=%s",
+                "proxy_installed=%s model_runner=%s "
+                "cum_steps=%d cum_signals=%d cum_will_compress=%d",
                 _step, _n_total, _n_press, _proxy_installed, _runner_class,
+                _W_CUM_STEPS, _W_CUM_SIGNALS_TOTAL, _W_CUM_WILL_COMPRESS,
             )
+            import sys as _sys_w
+            _sys_w.stderr.write(
+                f"[TRITN-INSTR] W:worker_execute step={_step} signals={_n_total} "
+                f"will_compress={_n_press} cum_will_compress={_W_CUM_WILL_COMPRESS}\n"
+            )
+            _sys_w.stderr.flush()
         except Exception:
             pass
     if _PATCHED_WORKER_ACTIVE:

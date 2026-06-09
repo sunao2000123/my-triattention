@@ -261,6 +261,30 @@ class TriAttentionScheduler(Scheduler):
                         estimated_cache_len, signal.reason,
                     )
                 signals[req_id] = signal
+        # --- INSTRUMENTATION (S) ---
+        # Cumulative per-step signal-build summary. Always logs the
+        # total scheduled requests and how many had compression
+        # signals. If "any_will_compress=False" but "any_signal=True",
+        # signals exist but no request has should_compress=True —
+        # implies the threshold check rejected every one.
+        if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            try:
+                import sys as _sys_s
+                _n_sched = sum(1 for _ in scheduled_items)
+                _n_sig = len(signals)
+                _n_press = sum(
+                    1 for _s in signals.values() if bool(getattr(_s, "should_compress", False))
+                )
+                # Per-step always; for the rate-limited case (every 100th step)
+                # also dump the requested-length vs threshold snapshot
+                _line = (
+                    f"[TRITN-INSTR] S:_build_signals step={self._triattention_step} "
+                    f"scheduled={_n_sched} signals={_n_sig} will_compress={_n_press}\n"
+                )
+                _sys_s.stderr.write(_line)
+                _sys_s.stderr.flush()
+            except Exception:
+                pass
         return signals
 
     def _sync_effective_kv_offsets_before_schedule(self) -> None:

@@ -38,6 +38,12 @@ class TriAttentionModelRunner:
     - keep vLLM forward path untouched.
     """
 
+    # Class-level cumulative counters (process-wide). Used by the
+    # instrumentation log to report the lifetime applied/skipped
+    # counts without re-parsing events.
+    _cumulative_applied: int = 0
+    _cumulative_skipped: int = 0
+
     def __init__(self, base_runner: Any, config: TriAttentionRuntimeConfig | None = None):
         self._base_runner = base_runner
         self.config = config or TriAttentionRuntimeConfig.from_env()
@@ -273,17 +279,32 @@ class TriAttentionModelRunner:
         # After execute_runner_compression_actions returns, dump the
         # events list: how many applied, how many skipped, what
         # reasons. If the events list is empty even though Level B
-        # fired, executor.execute is silently dropping on us.
+        # fired, executor.execute is silently dropping on us. Also
+        # update cumulative counters so we can see lifetime totals
+        # even when the per-step log is rate-limited.
         if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
             try:
                 _evs = self._pending_compression_events
                 _applied = sum(1 for e in _evs if e.get("status") == "applied")
                 _skipped = sum(1 for e in _evs if e.get("status") == "skipped")
                 _reasons = sorted({e.get("reason", "?") for e in _evs})
+                TriAttentionModelRunner._cumulative_applied += _applied
+                TriAttentionModelRunner._cumulative_skipped += _skipped
                 self._logger.info(
-                    "[TRITN-INSTR] C2:compress_done events=%d applied=%d skipped=%d reasons=%s",
+                    "[TRITN-INSTR] C2:compress_done events=%d applied=%d skipped=%d reasons=%s "
+                    "cumulative_applied=%d cumulative_skipped=%d",
                     len(_evs), _applied, _skipped, _reasons,
+                    TriAttentionModelRunner._cumulative_applied,
+                    TriAttentionModelRunner._cumulative_skipped,
                 )
+                import sys as _sys_c2
+                _sys_c2.stderr.write(
+                    f"[TRITN-INSTR] C2:compress_done events={len(_evs)} "
+                    f"applied={_applied} skipped={_skipped} "
+                    f"cumulative_applied={TriAttentionModelRunner._cumulative_applied} "
+                    f"cumulative_skipped={TriAttentionModelRunner._cumulative_skipped}\n"
+                )
+                _sys_c2.stderr.flush()
             except Exception:
                 pass
 
