@@ -97,6 +97,42 @@ def build_triattention_selector(
 
     effective_model_path = _resolve_effective_model_path()
 
+    # Resolve the actual compute device from the base_runner.
+    # The default in TriAttentionConfig is torch.device("cuda")
+    # which on vllm-ascend 0.18.0 (CPU-only torch + torch_npu
+    # plugin) raises NotImplementedError for aten::empty.
+    # We try several attributes in order of reliability.
+    effective_device: torch.device = torch.device("cpu")
+    if base_runner is not None:
+        _device_candidates = (
+            "device",                # vllm v1 base worker
+            "drafter_device",        # spec decode
+        )
+        for _dattr in _device_candidates:
+            _dv = getattr(base_runner, _dattr, None)
+            if isinstance(_dv, torch.device):
+                effective_device = _dv
+                break
+            if isinstance(_dv, str) and _dv.strip():
+                try:
+                    effective_device = torch.device(_dv)
+                    break
+                except Exception:
+                    pass
+        # Fall back: ascend-specific attribute (NPUModelRunner stores
+        # it as torch.device('npu:0') on self.device).
+        if effective_device.type == "cpu" and base_runner is not None:
+            _dv = getattr(base_runner, "device", None)
+            if isinstance(_dv, torch.device) and _dv.type != "cpu":
+                effective_device = _dv
+            elif isinstance(_dv, str) and _dv.strip():
+                try:
+                    _tmp = torch.device(_dv)
+                    if _tmp.type != "cpu":
+                        effective_device = _tmp
+                except Exception:
+                    pass
+
     tri_cfg = TriAttentionConfig(
         stats_path=stats_path,
         model_path=effective_model_path,
@@ -114,6 +150,7 @@ def build_triattention_selector(
         use_triton_scoring=True,
         compute_dtype=torch.float32,
         topk_dtype=torch.float32,
+        device=effective_device,
     )
     compressor = TriAttentionCompressor(tri_cfg)
     available_layers_sorted: tuple[int, ...] | None = None
