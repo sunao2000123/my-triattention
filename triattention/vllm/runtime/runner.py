@@ -238,6 +238,27 @@ class TriAttentionModelRunner:
         scheduler_output: Any,
         signals: dict[str, CompressionSignal],
     ) -> None:
+        # --- INSTRUMENTATION (Level B) ---
+        # One log line per signal (only for should_compress=True), showing
+        # the planner decision the scheduler sent us. If this fires but
+        # Level C never fires, the dispatcher (executor.execute) is the
+        # silent failure point.
+        if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            for _rid, _sig in signals.items():
+                if not bool(getattr(_sig, "should_compress", False)):
+                    continue
+                try:
+                    self._logger.info(
+                        "[TRITN-INSTR] B:per-signal req=%s step=%s "
+                        "est_cache_len=%s scheduled_tokens=%s reason=%s",
+                        _rid,
+                        getattr(_sig, "step", None),
+                        getattr(_sig, "estimated_cache_len", None),
+                        getattr(_sig, "scheduled_tokens", None),
+                        getattr(_sig, "reason", None),
+                    )
+                except Exception:
+                    pass
         self._pending_compression_events = execute_runner_compression_actions(
             executor=self.executor,
             state_store=self.state_store,
@@ -248,6 +269,23 @@ class TriAttentionModelRunner:
             logger=self._logger,
             log_decisions=bool(self.config.log_decisions),
         )
+        # --- INSTRUMENTATION (Level C') ---
+        # After execute_runner_compression_actions returns, dump the
+        # events list: how many applied, how many skipped, what
+        # reasons. If the events list is empty even though Level B
+        # fired, executor.execute is silently dropping on us.
+        if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            try:
+                _evs = self._pending_compression_events
+                _applied = sum(1 for e in _evs if e.get("status") == "applied")
+                _skipped = sum(1 for e in _evs if e.get("status") == "skipped")
+                _reasons = sorted({e.get("reason", "?") for e in _evs})
+                self._logger.info(
+                    "[TRITN-INSTR] C2:compress_done events=%d applied=%d skipped=%d reasons=%s",
+                    len(_evs), _applied, _skipped, _reasons,
+                )
+            except Exception:
+                pass
 
     def _apply_worker_block_reclaim_events(self) -> None:
         """Apply reclaim shrink to worker-side block tables before prepare_inputs()."""
@@ -384,6 +422,33 @@ class TriAttentionModelRunner:
         scheduler_output: Any,
         intermediate_tensors: Any = None,
     ) -> Any:
+        # --- INSTRUMENTATION (Level A) ---
+        # One log line per execute_model call. Gated by env var so
+        # default production behavior is unchanged. Use a unique prefix
+        # `[TRITN-INSTR]` so grep is one-liner. Counts:
+        #   how many signals the scheduler sent this step
+        #   how many of those have should_compress=True
+        #   how many new requests this step introduced
+        #   what the step number on scheduler_output is
+        # If this line is missing entirely, the proxy is not in the
+        # call chain at all.
+        if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            try:
+                _sig_dict = getattr(scheduler_output, "triattention_signals", None) or {}
+                _n_sig = len(_sig_dict)
+                _n_press = sum(
+                    1
+                    for _s in _sig_dict.values()
+                    if bool(getattr(_s, "should_compress", False))
+                )
+                _n_new = len(getattr(scheduler_output, "scheduled_new_reqs", []) or [])
+                _step = getattr(scheduler_output, "triattention_step", None)
+                _logger.info(
+                    "[TRITN-INSTR] A:execute_model step=%s signals=%d will_compress=%d new_reqs=%d",
+                    _step, _n_sig, _n_press, _n_new,
+                )
+            except Exception:
+                pass
         perf_enabled = bool(getattr(self._perf, "enabled", False))
         t_total = time.perf_counter() if perf_enabled else 0.0
         t0 = time.perf_counter() if perf_enabled else 0.0

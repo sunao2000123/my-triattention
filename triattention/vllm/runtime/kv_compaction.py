@@ -372,6 +372,25 @@ def compact_request_kv_in_place(
     still `total_tokens`, otherwise dropped entries continue participating in
     attention softmax as zero-K tokens and corrupt generation quality.
     """
+    # --- INSTRUMENTATION (Level F entry) ---
+    # CRITICAL silent-skip detection. If keep_tensor is empty, this
+    # function returns 0 without doing any work. If that happens at
+    # EVERY layer for EVERY request, the algorithm is "running" but
+    # producing no compaction, which would explain a tpot=baseline
+    # result perfectly. Watch for "early_return=empty_keep_set".
+    import os as _os_kc
+    _kc_instr = _os_kc.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1"
+    if _kc_instr:
+        try:
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "[TRITN-INSTR] F:compact_enter block_count=%s block_size=%d "
+                "total_tokens=%d preserve_dropped=%s",
+                len(block_ids) if hasattr(block_ids, "__len__") else "?",
+                block_size, total_tokens, preserve_dropped_tokens,
+            )
+        except Exception:
+            pass
     if isinstance(keep_token_indices, torch.Tensor):
         keep_tensor = keep_token_indices.to(device=kv_cache.device, dtype=torch.long).flatten()
     else:
@@ -381,6 +400,17 @@ def compact_request_kv_in_place(
             dtype=torch.long,
         )
     if keep_tensor.numel() == 0:
+        if _kc_instr:
+            try:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] F:compact_early_return reason=empty_keep_set "
+                    "total_tokens=%d block_count=%d",
+                    total_tokens,
+                    len(block_ids) if hasattr(block_ids, "__len__") else 0,
+                )
+            except Exception:
+                pass
         return 0
 
     key_cache, value_cache = _split_kv_axes(kv_cache)

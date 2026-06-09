@@ -57,6 +57,25 @@ def make_runner_compression_hook(
         return group_tensors_cache
 
     def _hook(req_id: str, signal: CompressionSignal, scheduler_output: Any) -> dict[str, Any]:
+        # --- INSTRUMENTATION (Level C' entry) ---
+        # This is the actual hook attached to base_runner. If you see
+        # Level C fire (executor.execute called) but no Level C' here,
+        # the hook was never installed (look for "runner_hook_missing"
+        # in the Level C log line).
+        import os as _os_hook
+        _hook_instr = _os_hook.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1"
+        if _hook_instr:
+            try:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] C_prime:hook_entry req=%s step=%s "
+                    "select_keep_indices=%s selector_status=%s",
+                    req_id, getattr(signal, "step", None),
+                    select_keep_indices is not None,
+                    selector_status,
+                )
+            except Exception:
+                pass
         setattr(base_runner, "_triattention_active_req_id", req_id)
         strict_triton_required = bool(
             config.enable_experimental_kv_compaction and config.require_triton_scoring
@@ -94,6 +113,16 @@ def make_runner_compression_hook(
         recent_unabsorbed_tokens = runtime_ctx.recent_unabsorbed_tokens
         should_defer_recompress = runtime_ctx.should_defer_recompress
         if effective_tokens <= budget_total or should_defer_recompress:
+            if _hook_instr:
+                try:
+                    import logging as _lg
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] C_prime:under_budget req=%s effective=%s budget=%s "
+                        "defer=%s",
+                        req_id, effective_tokens, budget_total, should_defer_recompress,
+                    )
+                except Exception:
+                    pass
             return {
                 "applied": False,
                 "reason": "under_budget",

@@ -67,6 +67,25 @@ def execute_runner_compression_actions(
                 signal=signal,
                 scheduler_output=scheduler_output,
             )
+            # --- INSTRUMENTATION (Level C) ---
+            # Result of the actual executor.execute call. If
+            # applied=False and reason="runner_hook_missing", the
+            # triattention_apply_compression hook was NEVER installed
+            # on the base runner, and the algorithm never ran — this
+            # is the single most common "looks-installed-but-isn't"
+            # failure mode.
+            import os as _os_instr
+            if _os_instr.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+                try:
+                    logger.info(
+                        "[TRITN-INSTR] C:executor_result req=%s step=%s applied=%s reason=%s cache_len_after=%s",
+                        req_id, getattr(signal, "step", None),
+                        getattr(result, "applied", None),
+                        getattr(result, "reason", None),
+                        getattr(result, "cache_len_after", None),
+                    )
+                except Exception:
+                    pass
         except Exception as exc:  # pragma: no cover - safety fallback
             if strict_no_downgrade:
                 logger.exception(

@@ -336,6 +336,28 @@ class TriAttentionScheduler(Scheduler):
         return scheduler_output
 
     def _apply_compression_events(self, compression_events: list[dict[str, Any]]) -> None:
+        # --- INSTRUMENTATION (Level G entry) ---
+        # Counts: how many events came in, how many are status="applied"
+        # (the only kind that triggers reclaim), how many have a
+        # block_reclaim payload. If applied=0 but events arrived,
+        # nothing in the worker side actually compacted.
+        import os as _os_ap
+        if _os_ap.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            try:
+                _ev_total = len(compression_events or [])
+                _ev_applied = sum(
+                    1 for e in (compression_events or []) if e.get("status") == "applied"
+                )
+                _ev_with_reclaim = sum(
+                    1 for e in (compression_events or [])
+                    if isinstance(e.get("block_reclaim"), dict)
+                )
+                logger.info(
+                    "[TRITN-INSTR] G:reclaim_enter events=%d applied=%d with_block_reclaim=%d",
+                    _ev_total, _ev_applied, _ev_with_reclaim,
+                )
+            except Exception:
+                pass
         coordinator = getattr(self.kv_cache_manager, "coordinator", None)
         managers = getattr(coordinator, "single_type_managers", None)
         block_size = int(getattr(self, "block_size", 1))
@@ -439,6 +461,17 @@ class TriAttentionScheduler(Scheduler):
                             )
                         if _free_reclaimed_blocks(manager, removed_blocks):
                             reclaim_applied_any = True
+                            # --- INSTRUMENTATION (Level G synthesized) ---
+                            import os as _os_g
+                            if _os_g.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+                                try:
+                                    logger.info(
+                                        "[TRITN-INSTR] G:reclaim_synthesized req=%s gid=%d "
+                                        "removed_blocks=%d kept_blocks=%d",
+                                        req_id, gid, len(removed_blocks), len(kept_blocks),
+                                    )
+                                except Exception:
+                                    pass
                 if reclaim_applied_any:
                     update_request_effective_kv_offset(
                         request=req,
@@ -524,6 +557,18 @@ class TriAttentionScheduler(Scheduler):
                         req_id, gid, len(removed_old_blocks),
                         len(kept_old_blocks), len(new_blocks_this_step),
                     )
+                    # --- INSTRUMENTATION (Level G explicit reclaim) ---
+                    import os as _os_g2
+                    if _os_g2.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+                        try:
+                            logger.info(
+                                "[TRITN-INSTR] G:reclaim_explicit req=%s gid=%d "
+                                "freed=%d kept=%d new_blocks=%d",
+                                req_id, gid, len(removed_old_blocks),
+                                len(kept_old_blocks), len(new_blocks_this_step),
+                            )
+                        except Exception:
+                            pass
                     if _free_reclaimed_blocks(manager, removed_old_blocks):
                         reclaim_applied_any = True
 

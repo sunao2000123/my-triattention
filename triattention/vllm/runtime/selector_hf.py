@@ -689,6 +689,26 @@ def build_triattention_selector(
         round_start: int,
         budget_total: int,
     ) -> dict[str, Any] | None:
+        # --- INSTRUMENTATION (Level E entry) ---
+        # Per-layer selector entry. Logs the key parameters used to
+        # make the keep/drop decision: how many tokens, what budget,
+        # what layer. The return is logged at the end of the method.
+        import os as _os_sel
+        _sel_instr = _os_sel.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1"
+        if _sel_instr:
+            try:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] E:select_keep_enter layer=%d total_tokens=%d "
+                    "prefill_len=%d protect_prefill=%s round_start=%d budget=%d "
+                    "input_path=%s",
+                    layer_idx, total_tokens, prefill_len, protect_prefill,
+                    round_start, budget_total,
+                    "keys_dense" if keys_dense is not None else
+                    ("paged" if kv_cache is not None else "NONE"),
+                )
+            except Exception:
+                pass
         if total_tokens <= budget_total:
             return {"mode": "shared", "indices": list(range(total_tokens))}
         if protect_prefill and config.include_prefill_in_budget and prefill_len > budget_total:
@@ -731,6 +751,17 @@ def build_triattention_selector(
                 sorted=False,
             ).indices[0]
             keep_per_head = torch.sort(topk, dim=-1).values.contiguous()
+            if _sel_instr:
+                try:
+                    import logging as _lg
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] E:select_keep_return layer=%d mode=per_head "
+                        "keep_count=%d (per head) total_tokens=%d scores_shape=%s",
+                        layer_idx, int(keep_per_head.shape[-1]), total_tokens,
+                        tuple(scores.shape),
+                    )
+                except Exception:
+                    pass
             return {"mode": "per_head", "indices": keep_per_head}
 
         scores_agg = scores
@@ -744,6 +775,16 @@ def build_triattention_selector(
             sorted=False,
         ).indices[0]
         keep = torch.sort(selected).values.contiguous()
+        if _sel_instr:
+            try:
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] E:select_keep_return layer=%d mode=shared keep_count=%d "
+                    "total_tokens=%d",
+                    layer_idx, int(keep.numel()), total_tokens,
+                )
+            except Exception:
+                pass
         return {"mode": "shared", "indices": keep}
 
     def _select_keep_indices_for_group_per_head(

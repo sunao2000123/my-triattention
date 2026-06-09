@@ -112,6 +112,27 @@ def compute_scores_triton(
     batch_size, num_kv_heads, seq_len, head_dim = key_states.shape
     freq_count = head_dim // 2
 
+    # --- INSTRUMENTATION (Level D entry) ---
+    # Logs the actual shape going into the Triton kernel. If
+    # seq_len is 0, the score is meaningless. If num_kv_heads is
+    # 0, the kernel will silently no-op. Use as a sanity check that
+    # the inputs the selector built are non-degenerate.
+    import os as _os_sc
+    if _os_sc.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+        try:
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "[TRITN-INSTR] D:triton_scoring_enter "
+                "batch=%d num_kv_heads=%d seq_len=%d head_dim=%d freq_count=%d "
+                "pruning_mode=%s score_aggregation=%s round_start=%s",
+                batch_size, num_kv_heads, seq_len, head_dim, freq_count,
+                getattr(config, "pruning_mode", None),
+                getattr(config, "score_aggregation", None),
+                round_start,
+            )
+        except Exception:
+            pass
+
     # Extract Q statistics from head_stats
     q_mean_complex = head_stats['q_mean_complex']  # [num_kv_heads, freq_count, 2]
     q_mean_real = q_mean_complex[..., 0].contiguous()  # [num_kv_heads, freq_count]
@@ -196,6 +217,24 @@ def compute_scores_triton(
         trig_values=active_trig_values,
         rope_style=config.rope_style,
     )  # [batch, num_kv_heads, seq_len]
+
+    # --- INSTRUMENTATION (Level D return) ---
+    # The actual kernel completed. Log returned shape and a quick
+    # zero-ness summary: if scores are all zero, topk is doomed
+    # downstream (selector will produce no keep set). This is the
+    # "kernel ran but produced garbage" detection point.
+    if _os_sc.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+        try:
+            import logging as _lg
+            _sc_sum = float(scores.abs().sum().item())
+            _sc_max = float(scores.abs().max().item())
+            _sc_min = float(scores.min().item())
+            _lg.getLogger(__name__).info(
+                "[TRITN-INSTR] D:triton_scoring_return shape=%s abs_sum=%.4f abs_max=%.4f min=%.4f",
+                tuple(scores.shape), _sc_sum, _sc_max, _sc_min,
+            )
+        except Exception:
+            pass
 
     # For per_layer mode, aggregate across heads
     if config.pruning_mode == "per_layer":
