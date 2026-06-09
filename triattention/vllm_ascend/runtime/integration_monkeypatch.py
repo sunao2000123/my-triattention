@@ -317,17 +317,47 @@ def _patched_npu_worker_init(self, *args, **kwargs):
     """
     assert _ORIG_WORKER_INIT is not None
     _ORIG_WORKER_INIT(self, *args, **kwargs)
+    # --- INSTRUMENTATION (NPUWorker init probe) ---
+    # Confirms: (a) the patched NPUWorker.__init__ wrapper was actually
+    # called in this subprocess; (b) the post-init defensive re-apply
+    # is happening. If this never fires, the worker subprocess was
+    # not patched.
+    import os as _os_wi
+    if _os_wi.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+        try:
+            _has_proxy_fn = hasattr(self, "_ensure_triattention_runner_proxy")
+            _sched_patched = getattr(
+                getattr(__import__("vllm.v1.core.sched.scheduler", fromlist=["Scheduler"]),
+                        "Scheduler", None),
+                "_triattention_patched", None,
+            ) if _os_wi.environ.get("TRIATTN_DEBUG_INSTRUMENT_VERBOSE", "0") == "1" else None
+            logger.info(
+                "[TRITN-INSTR] W:npu_worker_init class=%s has_proxy_fn=%s "
+                "patched_worker_active=%s",
+                type(self).__name__, _has_proxy_fn, _PATCHED_WORKER_ACTIVE,
+            )
+        except Exception:
+            pass
     if not _PATCHED_WORKER_ACTIVE:
         return
     if getattr(self, "_triattention_runner_proxy_installed", False):
         return
     self._triattention_runtime_config = TriAttentionRuntimeConfig.from_env()
+    self._triattention_runner_install_attempted = False
     self._triattention_runner_proxy_installed = False
     if _debug_early_install_proxy_enabled():
-        TriAttentionAscendWorker._ensure_triattention_runner_proxy(self)
-        logger.debug(
-            "[TriAttention-Ascend] eagerly installed runner proxy during NPUWorker.__init__"
-        )
+        try:
+            TriAttentionAscendWorker._ensure_triattention_runner_proxy(self)
+            logger.debug(
+                "[TriAttention-Ascend] eagerly installed runner proxy during NPUWorker.__init__"
+            )
+        except Exception as _exc:
+            # --- INSTRUMENTATION: log early-install failure ---
+            if _os_wi.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+                logger.info(
+                    "[TRITN-INSTR] W:early_proxy_install_FAILED exc=%s msg=%s",
+                    type(_exc).__name__, str(_exc)[:200],
+                )
     # Defensive re-apply: a fresh subprocess may have lost the patches
     # applied in the main process. Re-apply them on the actual class
     # objects in this subprocess.
@@ -364,6 +394,34 @@ def _patched_npu_worker_execute_model(self, scheduler_output):
     implementation otherwise.
     """
     assert _ORIG_WORKER_EXECUTE_MODEL is not None
+    # --- INSTRUMENTATION (Upstream worker-side probe) ---
+    # This wrapper runs on EVERY NPUWorker.execute_model call, BEFORE
+    # the TriAttentionModelRunner proxy may be installed. It is the
+    # earliest place we can see what the scheduler actually sent us.
+    # Logs the size of triattention_signals regardless of whether the
+    # proxy is installed — answers "is the worker even receiving
+    # non-empty signals?".
+    import os as _os_w
+    if _os_w.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+        try:
+            _sig = getattr(scheduler_output, "triattention_signals", None)
+            _step = getattr(scheduler_output, "triattention_step", None)
+            _n_total = len(_sig) if isinstance(_sig, dict) else 0
+            _n_press = (
+                sum(1 for s in _sig.values() if bool(getattr(s, "should_compress", False)))
+                if isinstance(_sig, dict) else 0
+            )
+            _proxy_installed = bool(
+                getattr(self, "_triattention_runner_proxy_installed", False)
+            )
+            _runner_class = type(getattr(self, "model_runner", None)).__name__
+            logger.info(
+                "[TRITN-INSTR] W:worker_execute step=%s signals=%d will_compress=%d "
+                "proxy_installed=%s model_runner=%s",
+                _step, _n_total, _n_press, _proxy_installed, _runner_class,
+            )
+        except Exception:
+            pass
     if _PATCHED_WORKER_ACTIVE:
         signals = getattr(scheduler_output, "triattention_signals", None)
         if signals:

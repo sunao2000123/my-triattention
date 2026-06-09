@@ -66,6 +66,31 @@ class TriAttentionAscendWorker:
         TriAttention signal arrives on the scheduler_output, so we
         wait for that.
         """
+        # --- INSTRUMENTATION: every entry to this function ---
+        import os as _os_p
+        _p_instr = _os_p.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1"
+        if _p_instr:
+            try:
+                _already = bool(
+                    getattr(worker, "_triattention_runner_proxy_installed", False)
+                )
+                _runner_class = type(
+                    getattr(worker, "model_runner", None)
+                ).__name__
+                _has_stats = bool(
+                    getattr(
+                        getattr(worker, "_triattention_runtime_config", None),
+                        "sparse_stats_path",
+                        None,
+                    )
+                )
+                logger.info(
+                    "[TRITN-INSTR] W:ensure_proxy_entry already_installed=%s "
+                    "current_runner=%s has_stats_path=%s",
+                    _already, _runner_class, _has_stats,
+                )
+            except Exception:
+                pass
         if getattr(worker, "_triattention_runner_proxy_installed", False):
             return
         if isinstance(getattr(worker, "model_runner", None), TriAttentionModelRunner):
@@ -77,7 +102,29 @@ class TriAttentionAscendWorker:
             worker._triattention_runtime_config = config
         _maybe_backfill_model_path(worker, config)
         base_runner = worker.model_runner
-        install_runner_compression_hook(base_runner=base_runner, config=config)
+        # --- INSTRUMENTATION: log the hook install attempt and any
+        # exception that it raises. install_runner_compression_hook
+        # raises RuntimeError if the stats file is missing or invalid.
+        if _p_instr:
+            try:
+                logger.info(
+                    "[TRITN-INSTR] W:before_install_hook runner_class=%s "
+                    "stats_path=%s",
+                    type(base_runner).__name__,
+                    str(getattr(config, "sparse_stats_path", None)),
+                )
+            except Exception:
+                pass
+        try:
+            install_runner_compression_hook(base_runner=base_runner, config=config)
+        except Exception as _exc:
+            if _p_instr:
+                logger.info(
+                    "[TRITN-INSTR] W:install_hook_FAILED exc=%s msg=%s "
+                    "(this is why proxy never installs, check stats file)",
+                    type(_exc).__name__, str(_exc)[:300],
+                )
+            raise
         worker.model_runner = TriAttentionModelRunner(
             base_runner=base_runner,
             config=config,
