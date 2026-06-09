@@ -423,6 +423,21 @@ class TriAttentionModelRunner:
         intermediate_tensors: Any = None,
     ) -> Any:
         # --- INSTRUMENTATION (Level A) ---
+        # Hard print on the very first line of the method, before any
+        # if/try/except. If the proxy is actually being called, this
+        # must fire. The other A log uses logger.info; this is print
+        # to stderr which cannot be silenced.
+        if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+            try:
+                import sys as _sys_a0
+                _sys_a0.stderr.write(
+                    f"[TRITN-INSTR] A:enter proxy_class={type(self).__name__} "
+                    f"id=0x{id(self):x} intermediate_tensors={intermediate_tensors is not None}\n"
+                )
+                _sys_a0.stderr.flush()
+            except Exception:
+                pass
+        # --- INSTRUMENTATION (Level A) ---
         # One log line per execute_model call. Gated by env var so
         # default production behavior is unchanged. Use a unique prefix
         # `[TRITN-INSTR]` so grep is one-liner. Counts:
