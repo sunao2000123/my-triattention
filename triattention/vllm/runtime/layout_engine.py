@@ -43,6 +43,10 @@ class PreparedLayerCompaction:
     kv_cache: torch.Tensor
     block_ids: torch.Tensor
     keep_plan: KeepPlan
+    # Optional parallel value cache tensor (Ascend v0.18.0 stores K and V
+    # as two separate 4D tensors). When None, the compaction routine treats
+    # the single ``kv_cache`` as both K and V (CUDA upstream layout).
+    value_cache: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,7 @@ def compact_layer_with_keep_plan(
     enable_experimental_block_reclaim: bool,
     shared_compact_fn: Any | None = None,
     per_head_compact_fn: Any | None = None,
+    value_cache: torch.Tensor | None = None,
 ) -> LayerCompactionResult:
     keep_count = keep_plan.keep_count()
     before_required = num_required_blocks(total_tokens, block_size)
@@ -88,6 +93,7 @@ def compact_layer_with_keep_plan(
             keep_token_indices_per_head=keep_plan.indices,
             total_tokens=total_tokens,
             preserve_dropped_tokens=preserve_dropped_tokens,
+            value_cache=value_cache,
         )
     else:
         shared_fn = shared_compact_fn or compact_request_kv_in_place
@@ -98,6 +104,7 @@ def compact_layer_with_keep_plan(
             keep_token_indices=keep_plan.indices,
             total_tokens=total_tokens,
             preserve_dropped_tokens=preserve_dropped_tokens,
+            value_cache=value_cache,
         )
 
     return LayerCompactionResult(
@@ -133,6 +140,7 @@ def compact_prepared_group_layers(
             enable_experimental_block_reclaim=enable_experimental_block_reclaim,
             shared_compact_fn=shared_compact_fn,
             per_head_compact_fn=per_head_compact_fn,
+            value_cache=task.value_cache,
         )
         results.append((task.layer_idx, result))
     return results

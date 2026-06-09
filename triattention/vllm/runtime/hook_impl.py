@@ -47,10 +47,14 @@ def make_runner_compression_hook(
             select_keep_indices_for_group,
             selector_status,
         ) = _build_triattention_selector(config)
-    group_tensors_cache: dict[int, list[tuple[int, torch.Tensor]]] | None = None
+    group_tensors_cache: dict[
+        int, list[tuple[int, torch.Tensor, torch.Tensor | None]]
+    ] | None = None
     compressed_once: set[str] = set()
 
-    def _get_group_tensors() -> dict[int, list[tuple[int, torch.Tensor]]]:
+    def _get_group_tensors() -> dict[
+        int, list[tuple[int, torch.Tensor, torch.Tensor | None]]
+    ]:
         nonlocal group_tensors_cache
         if group_tensors_cache is None:
             group_tensors_cache = _resolve_group_tensors(base_runner)

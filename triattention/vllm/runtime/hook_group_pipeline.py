@@ -50,7 +50,9 @@ def run_group_compaction_pipeline(
     budget_total: int,
     block_size: int,
     mutable_block_ids_by_group: list[list[int] | None],
-    group_tensors: dict[int, list[tuple[int, torch.Tensor]]],
+    group_tensors: dict[
+        int, list[tuple[int, torch.Tensor, torch.Tensor | None]]
+    ],
     select_keep_indices: Callable[..., dict[str, Any] | None] | None,
     select_keep_indices_for_group: Callable[..., dict[str, Any] | None] | None,
     shared_compact_fn: Callable[..., Any],

@@ -21,6 +21,84 @@ def infer_layer_idx(layer_name: str, layer_obj: Any, fallback_idx: int) -> int:
     return fallback_idx
 
 
+def _unwrap_kv_cache_entry(entry: Any) -> torch.Tensor | None:
+    """Unwrap the per-layer ``kv_cache`` attribute to a single K-cache tensor.
+
+    vLLM upstream ``bind_kv_cache`` writes ``layer.kv_cache = [kv_cache]`` —
+    a list with one element. On vllm-ascend v0.18.0 the inner value is a
+    tuple ``(k_cache, v_cache)`` (see
+    ``vllm_ascend/worker/model_runner_v1.py:3017-3023``), so the
+    attribute looks like ``[(k_tensor, v_tensor)]``.
+
+    Some legacy backends store ``layer.kv_cache = [K, V]`` (a flat list of
+    two tensors); others store ``layer.kv_cache = tensor`` (bare).
+
+    This helper returns the K-cache tensor in all four layouts, or
+    ``None`` if the entry cannot be interpreted.
+    """
+    if isinstance(entry, torch.Tensor):
+        return entry
+    if isinstance(entry, tuple):
+        # (K, V) — Ascend pattern, or (K, V, aux1, aux2) — Ascend DSA
+        for item in entry:
+            if isinstance(item, torch.Tensor):
+                return item
+        return None
+    if isinstance(entry, list):
+        if not entry:
+            return None
+        first = entry[0]
+        if isinstance(first, torch.Tensor):
+            # CUDA upstream pattern: [tensor]
+            return first
+        if isinstance(first, tuple):
+            # Ascend pattern: [(K, V)]
+            for item in first:
+                if isinstance(item, torch.Tensor):
+                    return item
+            return None
+        return None
+    return None
+
+
+def _unwrap_kv_cache_pair(entry: Any) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Unwrap the per-layer ``kv_cache`` attribute to ``(K, V)`` pair.
+
+    Returns ``(K_tensor, V_tensor)`` when both are present, or just
+    ``(K_tensor, None)`` when only a single tensor is exposed (CUDA upstream
+    layout, where K/V are fused in one 5D tensor).
+
+    Returns ``None`` if the entry cannot be interpreted.
+    """
+    if isinstance(entry, torch.Tensor):
+        return entry, None
+    if isinstance(entry, tuple):
+        # (K, V) — Ascend pattern; first two tensor slots are K and V.
+        tensors = [item for item in entry if isinstance(item, torch.Tensor)]
+        if not tensors:
+            return None
+        k = tensors[0]
+        v = tensors[1] if len(tensors) > 1 else None
+        return k, v
+    if isinstance(entry, list):
+        if not entry:
+            return None
+        first = entry[0]
+        if isinstance(first, torch.Tensor):
+            # CUDA upstream pattern: [tensor] — fused K/V
+            return first, None
+        if isinstance(first, tuple):
+            # Ascend pattern: [(K, V, ...)]
+            tensors = [item for item in first if isinstance(item, torch.Tensor)]
+            if not tensors:
+                return None
+            k = tensors[0]
+            v = tensors[1] if len(tensors) > 1 else None
+            return k, v
+        return None
+    return None
+
+
 def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
     attn_groups = getattr(base_runner, "attn_groups", None)
     if not isinstance(attn_groups, (list, tuple)):
@@ -65,13 +143,22 @@ def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
     return None
 
 
-def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.Tensor]]]:
+def resolve_group_tensors(
+    base_runner: Any,
+) -> dict[int, list[tuple[int, torch.Tensor, torch.Tensor | None]]]:
     """Resolve kv cache tensors for each kv cache group.
 
     Returns:
-        gid -> list of (layer_idx, kv_cache_tensor)
+        gid -> list of ``(layer_idx, k_cache_tensor, v_cache_tensor_or_None)``
+
+        The V tensor is ``None`` for upstream CUDA layouts where K and V
+        are fused in one 5D tensor (``[2, num_blocks, block_size, H, D]``).
+        For vllm-ascend v0.18.0 the V tensor is a separate 4D tensor
+        (``[num_blocks, block_size, H, D]``); the compactor applies the
+        same permutation to both K and V in lock-step so the attention
+        backend reads consistent data after reclaim.
     """
-    group_tensors: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    group_tensors: dict[int, list[tuple[int, torch.Tensor, torch.Tensor | None]]] = {}
 
     kv_cache_config = getattr(base_runner, "kv_cache_config", None)
     compilation_config = getattr(base_runner, "compilation_config", None)
@@ -84,11 +171,12 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
     if kv_cache_config is None or not isinstance(static_forward_context, dict):
         fallback = getattr(base_runner, "kv_caches", None)
         if isinstance(fallback, list):
-            tensors = [
-                (idx, t)
-                for idx, t in enumerate(fallback)
-                if isinstance(t, torch.Tensor)
-            ]
+            tensors: list[tuple[int, torch.Tensor, torch.Tensor | None]] = []
+            for idx, entry in enumerate(fallback):
+                pair = _unwrap_kv_cache_pair(entry)
+                if pair is not None:
+                    k_tensor, v_tensor = pair
+                    tensors.append((idx, k_tensor, v_tensor))
             if tensors:
                 group_tensors[0] = tensors
         return group_tensors
@@ -101,19 +189,18 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
         layer_names = getattr(group, "layer_names", None)
         if not isinstance(layer_names, (list, tuple)):
             continue
-        tensors: list[tuple[int, torch.Tensor]] = []
+        tensors: list[tuple[int, torch.Tensor, torch.Tensor | None]] = []
         seen_ptrs: set[int] = set()
         for local_idx, layer_name in enumerate(layer_names):
             layer = static_forward_context.get(layer_name)
             if layer is None:
                 continue
-            kv_cache_list = getattr(layer, "kv_cache", None)
-            if not isinstance(kv_cache_list, list) or not kv_cache_list:
+            kv_cache_attr = getattr(layer, "kv_cache", None)
+            pair = _unwrap_kv_cache_pair(kv_cache_attr)
+            if pair is None:
                 continue
-            tensor = kv_cache_list[0]
-            if not isinstance(tensor, torch.Tensor):
-                continue
-            ptr = tensor.data_ptr()
+            k_tensor, v_tensor = pair
+            ptr = k_tensor.data_ptr()
             if ptr in seen_ptrs:
                 continue
             seen_ptrs.add(ptr)
@@ -124,15 +211,16 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
                         layer_obj=layer,
                         fallback_idx=local_idx,
                     ),
-                    tensor,
+                    k_tensor,
+                    v_tensor,
                 )
             )
         if tensors:
             kv_axis_hint = _infer_kv_axis_from_group_backend(base_runner=base_runner, gid=gid)
             if kv_axis_hint is not None:
-                for _layer_idx, tensor in tensors:
+                for _layer_idx, k_tensor, _v_tensor in tensors:
                     try:
-                        register_kv_layout_axis_hint(tensor, kv_axis_hint)
+                        register_kv_layout_axis_hint(k_tensor, kv_axis_hint)
                     except ValueError:
                         # Best effort registration only; compaction path will fail-fast if
                         # an ambiguous layout cannot be safely disambiguated.

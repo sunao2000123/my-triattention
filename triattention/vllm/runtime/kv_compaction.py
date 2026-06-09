@@ -378,6 +378,7 @@ def compact_request_kv_in_place(
     keep_token_indices: Iterable[int] | torch.Tensor,
     total_tokens: int,
     preserve_dropped_tokens: bool = True,
+    value_cache: torch.Tensor | None = None,
 ) -> int:
     """Compact KV for a single request in-place.
 
@@ -432,7 +433,9 @@ def compact_request_kv_in_place(
                 pass
         return 0
 
-    key_cache, value_cache = _split_kv_axes(kv_cache)
+    key_cache, default_value_cache = _split_kv_axes(kv_cache)
+    if value_cache is None:
+        value_cache = default_value_cache
     if keep_tensor.numel() > 0:
         min_idx = int(keep_tensor.min().item())
         max_idx = int(keep_tensor.max().item())
@@ -514,13 +517,16 @@ def compact_request_kv_in_place_per_head(
     keep_token_indices_per_head: list[list[int]] | torch.Tensor,
     total_tokens: int,
     preserve_dropped_tokens: bool = True,
+    value_cache: torch.Tensor | None = None,
 ) -> int:
     """Compact KV in-place using independent keep indices for each KV head.
 
     Reorder each head with [kept..., dropped...] permutation while preserving
     all tokens per head (no tail zeroing).
     """
-    key_cache, value_cache = _split_kv_axes(kv_cache)
+    key_cache, default_value_cache = _split_kv_axes(kv_cache)
+    if value_cache is None:
+        value_cache = default_value_cache
     device = key_cache.device
     num_kv_heads = key_cache.shape[2]
     if isinstance(keep_token_indices_per_head, torch.Tensor):

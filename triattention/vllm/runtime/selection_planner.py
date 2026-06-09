@@ -131,7 +131,10 @@ def prepare_group_layer_compactions(
                 def _iter_layer_kv() -> Iterable[
                     tuple[int, torch.Tensor, list[int] | torch.Tensor, int]
                 ]:
-                    for layer_idx, kv_cache in layer_tensors:
+                    for layer_entry in layer_tensors:
+                        # layer_tensors entries are (layer_idx, k_cache, v_cache_or_None)
+                        layer_idx = layer_entry[0]
+                        kv_cache = layer_entry[1]
                         yield layer_idx, kv_cache, normalized_block_ids, block_size
 
                 selected_for_group = select_keep_indices_for_group(
@@ -147,7 +150,10 @@ def prepare_group_layer_compactions(
             else:
 
                 def _iter_layer_inputs() -> Iterable[tuple[int, torch.Tensor]]:
-                    for layer_idx, kv_cache in layer_tensors:
+                    for layer_entry in layer_tensors:
+                        # layer_tensors entries are (layer_idx, k_cache, v_cache_or_None)
+                        layer_idx = layer_entry[0]
+                        kv_cache = layer_entry[1]
                         block_ids_tensor = block_ids_tensor_cache.get(kv_cache.device)
                         if block_ids_tensor is None:
                             block_ids_tensor = torch.as_tensor(
@@ -189,7 +195,11 @@ def prepare_group_layer_compactions(
                 f"root_cause={_root_type}:{_root_msg[:160]}"
             ) from exc
 
-    for layer_idx, kv_cache in layer_tensors:
+    for layer_entry in layer_tensors:
+        # layer_tensors entries are (layer_idx, k_cache, v_cache_or_None)
+        layer_idx = layer_entry[0]
+        kv_cache = layer_entry[1]
+        v_cache = layer_entry[2] if len(layer_entry) > 2 else None
         block_ids_tensor = block_ids_tensor_cache.get(kv_cache.device)
         if block_ids_tensor is None:
             block_ids_tensor = torch.as_tensor(
@@ -275,6 +285,7 @@ def prepare_group_layer_compactions(
                 kv_cache=kv_cache,
                 block_ids=block_ids_tensor,
                 keep_plan=keep_plan,
+                value_cache=v_cache,
             )
         )
 
