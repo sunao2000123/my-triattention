@@ -426,6 +426,33 @@ def _patched_npu_worker_execute_model(self, scheduler_output):
         signals = getattr(scheduler_output, "triattention_signals", None)
         if signals:
             TriAttentionAscendWorker._ensure_triattention_runner_proxy(self)
+    # --- INSTRUMENTATION: snapshot state right before dispatch ---
+    # Print what the engine's actual model_runner looks like and dump
+    # every attribute that contains "runner" / "model" to help identify
+    # if vllm-ascend 0.18.0 V2 dispatches via a different attribute.
+    import os as _os_d
+    if _os_d.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") == "1":
+        try:
+            import sys as _sys_d
+            _runner_cls = type(getattr(self, "model_runner", None)).__name__
+            _runner_id = id(getattr(self, "model_runner", None))
+            _related = sorted(
+                (k, type(v).__name__)
+                for k, v in vars(self).items()
+                if "runner" in k.lower() or "model" in k.lower()
+            )
+            _line = (
+                f"[TRITN-INSTR] W:before_dispatch model_runner={_runner_cls} "
+                f"id=0x{_runner_id:x} related_attrs={_related}\n"
+            )
+            _sys_d.stderr.write(_line)
+            _sys_d.stderr.flush()
+        except Exception as _exc_d:
+            import sys as _sys_e
+            _sys_e.stderr.write(
+                f"[TRITN-INSTR] W:before_dispatch_LOGGING_FAILED exc={type(_exc_d).__name__}\n"
+            )
+            _sys_e.stderr.flush()
     return _ORIG_WORKER_EXECUTE_MODEL(self, scheduler_output)
 
 
