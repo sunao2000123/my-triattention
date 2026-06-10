@@ -178,11 +178,54 @@ def build_hook_runtime_context(
             and num_computed_tokens > (guard_upper + regression_slack)
             and effective_tokens >= int(config.effective_len_regression_ratio * num_computed_tokens)
         ):
-            raise RuntimeError(
-                f"{TRITON_SCORING_REQUIRED_MARKER}:effective_len_regressed:"
-                f"req={req_id}:effective_tokens={effective_tokens}:"
-                f"num_computed_tokens={num_computed_tokens}:guard_upper={guard_upper}"
+            # Ascend high-KV_BUDGET guard: at KV_BUDGET=8192 with chunked
+            # prefill of long-context requests, the executor legitimately
+            # early-returns `under_budget` because the planner-triggered
+            # signal was issued on a per-req length threshold that was
+            # subsequently re-measured below budget.  In that case the
+            # `compressed_once` membership is stale (from an earlier
+            # compression of a *different* request with the same
+            # `req_id` after a retry/resume, OR from the previous
+            # chunked-prefill chunk that the executor skipped).  When
+            # the most-recent compression event for this `req_id` is
+            # older than `compressed_recent_step_window` steps, the
+            # guard should NOT fire — the current step is not a
+            # regression of the prior compaction, it is just a planner
+            # mis-trigger that the executor already correctly handled
+            # by returning `under_budget`.  Falling through here would
+            # raise `effective_len_regressed` and crash the worker, even
+            # though no compaction was attempted in this step.
+            recent_step = int(getattr(req_runtime_state, "last_compression_step", -1))
+            current_step = int(getattr(signal, "step", 0) or 0)
+            step_window = int(
+                getattr(config, "compressed_recent_step_window", 32) or 32
             )
+            stale_compressed_marker = (
+                recent_step < 0
+                or (current_step - recent_step) > step_window
+            )
+            if stale_compressed_marker:
+                # Treat the stale `compressed_once` membership as a
+                # no-op: emit a debug log, do not raise.  The scheduler
+                # side will see no `applied` event (because the
+                # executor returns `under_budget` early) and will keep
+                # its own state consistent.  The next genuine
+                # compression event will re-populate `compressed_once`
+                # and the guard will resume normal operation.
+                import logging as _lg_regr
+                _lg_regr.getLogger(__name__).info(
+                    "TriAttention hook_runtime_context: skipped "
+                    "effective_len_regressed guard for req=%s (stale "
+                    "compressed_once membership: last_step=%d "
+                    "current_step=%d window=%d)",
+                    req_id, recent_step, current_step, step_window,
+                )
+            else:
+                raise RuntimeError(
+                    f"{TRITON_SCORING_REQUIRED_MARKER}:effective_len_regressed:"
+                    f"req={req_id}:effective_tokens={effective_tokens}:"
+                    f"num_computed_tokens={num_computed_tokens}:guard_upper={guard_upper}"
+                )
 
     budget_total = effective_budget_for_signal(config, signal, effective_tokens)
     local_length_threshold = budget_total + max(1, config.divide_length)

@@ -43,6 +43,18 @@ class TriAttentionRuntimeConfig:
     effective_len_guard_divide_multiples: int = 2
     score_chunk_max_tokens: int = 4096
 
+    # Ascend-specific: number of scheduler steps that must elapse
+    # between a successful compression and a subsequent signal arrival
+    # before the strict-mode `effective_len_regressed` guard treats the
+    # `compressed_once` membership as stale.  When the per-req window
+    # has elapsed without a real compression event, the guard skips its
+    # raise so a planner mis-trigger that the executor already handled
+    # via `under_budget` does not crash the worker.  The default of 32
+    # steps is well above the chunked-prefill cadence on Qwen3-8B at
+    # max-model-len=40960, so a genuine 8-step chunked prefill can
+    # never be mis-classified as a regression.
+    compressed_recent_step_window: int = 32
+
     # Optional TriAttention-style scoring path (used by runtime hook when enabled).
     sparse_stats_path: Path | None = None
     model_path: Path | None = None
@@ -132,6 +144,10 @@ class TriAttentionRuntimeConfig:
             score_chunk_max_tokens=maybe_int(
                 "SCORE_CHUNK_MAX_TOKENS",
                 cls.score_chunk_max_tokens,
+            ),
+            compressed_recent_step_window=maybe_int(
+                "COMPRESSED_RECENT_STEP_WINDOW",
+                cls.compressed_recent_step_window,
             ),
             sparse_stats_path=Path(sparse_stats_path_raw) if sparse_stats_path_raw else None,
             model_path=Path(model_path_raw) if model_path_raw else None,

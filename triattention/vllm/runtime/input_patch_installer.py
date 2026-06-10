@@ -14,6 +14,7 @@ _PATCH_INSTALLED = False
 _ORIGINAL_PREPARE_POS_SEQ_LENS: Callable[..., Any] | None = None
 _ORIGINAL_COMPUTE_SLOT_MAPPINGS: Callable[..., Any] | None = None
 _ORIGINAL_V1_PREPARE_INPUTS: Callable[..., Any] | None = None
+_ASCEND_PATCH_OK: bool | None = None
 
 
 def _debug_disable_v1_override_path() -> bool:
@@ -25,15 +26,37 @@ def _debug_disable_v1_override_path() -> bool:
     }
 
 
+def _try_install_ascend_patch() -> bool:
+    """Best-effort delegate to the Ascend-side slot_mappings clamp.
+
+    Returns True if the Ascend patch installed (or was already installed).
+    Called only when the GPU path did not apply.  Uses a local import
+    to avoid pulling vllm_ascend on platforms where it is not installed.
+    """
+    try:
+        from triattention.vllm_ascend.runtime.gpu_seq_len_patch import (
+            install_seq_len_override_patch as _ascend_install,
+        )
+    except Exception:
+        return False
+    try:
+        return bool(_ascend_install())
+    except Exception:
+        return False
+
+
 def install_runtime_input_patch_hooks() -> bool:
     """Patch vLLM GPU input prep once.
 
     Returns True when the patch is active (including repeated calls).
+    On Ascend, falls back to the vllm_ascend-side slot_mappings clamp
+    that masks out-of-bounds tokens to PAD_SLOT_ID, so the post-reclaim
+    `num_blocks_per_row` cap is honored by the slot_mapping kernel.
     """
     global _PATCH_INSTALLED, _ORIGINAL_PREPARE_POS_SEQ_LENS, _ORIGINAL_COMPUTE_SLOT_MAPPINGS
-    global _ORIGINAL_V1_PREPARE_INPUTS
+    global _ORIGINAL_V1_PREPARE_INPUTS, _ASCEND_PATCH_OK
     if _PATCH_INSTALLED:
-        return True
+        return _ASCEND_PATCH_OK if _ASCEND_PATCH_OK is not None else True
 
     patched_any = False
 
@@ -71,6 +94,13 @@ def install_runtime_input_patch_hooks() -> bool:
                     _ORIGINAL_V1_PREPARE_INPUTS
                 )
                 patched_any = True
+
+    if not patched_any:
+        # GPU path not available: try the Ascend fallback.  We do this
+        # even if the Ascend module import fails (returns False) so the
+        # caller can decide whether the no-patch state is acceptable.
+        patched_any = _try_install_ascend_patch()
+    _ASCEND_PATCH_OK = patched_any
 
     _PATCH_INSTALLED = patched_any
     return patched_any
