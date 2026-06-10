@@ -7,6 +7,8 @@ import os
 import time
 from typing import Any
 
+import numpy as np
+
 from .config import TriAttentionRuntimeConfig
 from .executor import CompressionExecutor, RunnerHookCompressionExecutor
 from .input_patch_backend import install_runtime_input_patch
@@ -318,6 +320,99 @@ class TriAttentionModelRunner:
             events=self._pending_compression_events,
         )
 
+    def _maybe_clamp_num_computed_tokens_for_compressed_reqs(self) -> dict[str, int]:
+        """Temporarily overwrite `num_computed_tokens_cpu[req_idx]` for compressed
+        requests so that the next `base_runner.execute_model` derives the
+        `positions` / `seq_lens` / `slot_mapping` from the post-reclaim length.
+
+        Returns a dict of `{req_id: original_nct}` so the caller can restore
+        the values after the forward pass.  This is the Ascend equivalent of
+        the CUDA `prepare_pos_seq_lens` seq_lens-override patch: we are
+        forced to do it on the runner side because vLLM-Ascend 0.18.0 does
+        not expose a per-req seq_lens hook on the V1 numpy path.
+
+        We derive the per-req clamp target from `self.state_store` rather
+        than from `request._triattention_effective_kv_offset` because the
+        latter is set on the scheduler-side `Request` object, which is a
+        different process / Python instance from the worker's
+        `CachedRequestState`.  The TriAttention `RequestStateStore` lives
+        in the runner and is reachable from here.
+        """
+        restored: dict[str, int] = {}
+        if not self._pending_compression_events:
+            return restored
+        input_batch = getattr(self._base_runner, "input_batch", None)
+        if input_batch is None:
+            return restored
+        nct = getattr(input_batch, "num_computed_tokens_cpu", None)
+        if not isinstance(nct, np.ndarray):
+            return restored
+        req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+        if not isinstance(req_id_to_index, dict):
+            return restored
+        num_scheduled_lookup: dict[str, int] = {}
+        scheduled_cached = getattr(
+            getattr(self, "_last_scheduler_output", None), "scheduled_cached_reqs", None
+        )
+        if scheduled_cached is not None:
+            cached_req_ids = getattr(scheduled_cached, "req_ids", None)
+            cached_nct = getattr(scheduled_cached, "num_computed_tokens", None)
+            if isinstance(cached_req_ids, list) and isinstance(cached_nct, list):
+                if len(cached_req_ids) == len(cached_nct):
+                    for rid, n in zip(cached_req_ids, cached_nct):
+                        if isinstance(rid, str) and isinstance(n, int):
+                            num_scheduled_lookup[rid] = n
+        new_reqs_lookup: dict[str, int] = {}
+        # New requests always start with their full prompt length cached
+        # (i.e. num_computed_tokens == num_prompt_tokens).  We don't
+        # clamp those — they have no `_triattention_effective_kv_offset`.
+        for event in self._pending_compression_events:
+            if not isinstance(event, dict) or event.get("status") != "applied":
+                continue
+            req_id = event.get("req_id")
+            if not isinstance(req_id, str):
+                continue
+            req_idx = req_id_to_index.get(req_id)
+            if not isinstance(req_idx, int):
+                continue
+            tri_state = self.state_store.get(req_id)
+            if tri_state is None:
+                continue
+            target = int(getattr(tri_state, "current_cache_len", 0) or 0)
+            if target <= 0:
+                continue
+            original = int(nct[req_idx])
+            new_val = max(0, target)
+            if new_val < original:
+                nct[req_idx] = new_val
+                restored[req_id] = original
+        if restored:
+            self._logger.info(
+                "TriAttention runner: clamped num_computed_tokens_cpu for %d "
+                "compressed requests before base_runner.execute_model "
+                "(post-reclaim current_cache_len)",
+                len(restored),
+            )
+        return restored
+
+    def _restore_num_computed_tokens(self, restored: dict[str, int]) -> None:
+        """Inverse of `_maybe_clamp_num_computed_tokens_for_compressed_reqs`."""
+        if not restored:
+            return
+        input_batch = getattr(self._base_runner, "input_batch", None)
+        if input_batch is None:
+            return
+        nct = getattr(input_batch, "num_computed_tokens_cpu", None)
+        if not isinstance(nct, np.ndarray):
+            return
+        req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+        if not isinstance(req_id_to_index, dict):
+            return
+        for req_id, original in restored.items():
+            req_idx = req_id_to_index.get(req_id)
+            if isinstance(req_idx, int):
+                nct[req_idx] = original
+
     def _patch_scheduler_output_for_compressed_reqs(self, scheduler_output: Any) -> None:
         """Trim stale new_block_ids for compressed requests (V1 batch-queue).
 
@@ -519,14 +614,37 @@ class TriAttentionModelRunner:
         need_effective_overrides = self._needs_effective_input_overrides(scheduler_output)
         self._ensure_runtime_input_patch_if_needed(need_effective_overrides)
         bridge_perf: dict[str, float] | None = {} if perf_enabled else None
-        output = execute_base_model_with_effective_overrides(
-            base_runner=self._base_runner,
-            state_store=self.state_store,
-            scheduler_output=scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            use_effective_overrides=need_effective_overrides,
-            perf_out=bridge_perf,
+        # Ascend-only: publish the TriAttention state store and the
+        # pending compression events on the base runner so the
+        # `gpu_seq_len_patch` wrappers on the Ascend side (which only
+        # see the underlying NPUModelRunner) can read them and apply
+        # the post-reclaim num_computed_tokens clamp inside
+        # `_update_states`.  The runner-side
+        # `_maybe_clamp_num_computed_tokens_for_compressed_reqs` is
+        # kept as a backup in case the vllm-ascend path doesn't pick
+        # up the gpu_seq_len_patch install.
+        setattr(
+            self._base_runner,
+            "_triattention_state_store",
+            self.state_store,
         )
+        setattr(
+            self._base_runner,
+            "_triattention_pending_compression_events",
+            list(self._pending_compression_events),
+        )
+        nct_restored = self._maybe_clamp_num_computed_tokens_for_compressed_reqs()
+        try:
+            output = execute_base_model_with_effective_overrides(
+                base_runner=self._base_runner,
+                state_store=self.state_store,
+                scheduler_output=scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                use_effective_overrides=need_effective_overrides,
+                perf_out=bridge_perf,
+            )
+        finally:
+            self._restore_num_computed_tokens(nct_restored)
         self._perf.record_model_output(output)
         t_total_exec_ms = (time.perf_counter() - t_total) * 1000.0 if perf_enabled else 0.0
         has_trigger = any(bool(sig.should_compress) for sig in signals.values()) if signals else False

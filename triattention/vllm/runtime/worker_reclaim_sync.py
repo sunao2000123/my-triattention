@@ -1,47 +1,47 @@
 """Worker-side block-table reclaim synchronization helpers for TriAttention runtime.
 
-Critical Ascend-specific hardening: the V1 path that simply
-decrements `num_blocks_per_row[req_index]` is **insufficient** on Ascend
-because the `_compute_slot_mappings_kernel` (in
-`vllm_ascend/worker/v2/block_table.py`) does not consult
-`num_blocks_per_row` — it reads the whole row of `block_table` (up to
-`TOTAL_BLOCK_SIZE = 4096` entries) for each request and then indexes by
-`position // block_size`.  When the post-reclaim `num_blocks_per_row` is
-shrunk, the *stale* block_ids at indices `>= num_blocks_per_row` still
-sit in the row, and a request whose absolute position exceeds the
-post-reclaim block count will look up a recycled block_id belonging to
-another request.  This is the primary cause of:
+CRITICAL CORRECTION (post-mortem of an earlier regression):
 
-- **Accuracy loss** (TriAttention accuracy 18 % vs CUDA 32 % at
-  KV_BUDGET=2048): the kernel reads foreign KV data and the attention
-  output is computed over garbage keys.
-- **`TRIATTN_FATAL_TRITON_SCORING_REQUIRED:effective_len_regressed`
-  crash** at KV_BUDGET=8192: in the next step the runtime context's
-  `effective_tokens` (computed from `state.current_cache_len`) diverges
-  from the worker's `num_computed_tokens` (absolute decode position);
-  the strict-mode guard `effective_tokens >= ratio * num_computed_tokens`
-  fires.
+An earlier version of this module additionally **zeroed the trailing
+block-id slots in the row** when truncating `num_blocks_per_row`.  This
+turned out to be **catastrophic** on the vLLM-Ascend 0.18.0 V1 path:
 
-The defense-in-depth fix has two layers:
+- vLLM-Ascend 0.18.0's hot path is the V1 numpy-based
+  `vllm_ascend.worker.block_table.BlockTable.compute_slot_mapping` (NOT
+  the V2 Triton kernel in `vllm_ascend/worker/v2/block_table.py` —
+  `AscendBlockTables` is only used by the formal V2 model state path
+  that is not exercised by `NPUInputBatch`).
+- The V1 path indexes `block_table.np.ravel()[block_table_indices]`
+  unconditionally — there is **no `num_blocks_per_row` mask** anywhere
+  in the call.  After a TriAttention compaction, a request whose
+  absolute decode position exceeds the post-reclaim block count reads
+  recycled block ids and the attention kernel computes over foreign
+  KV data.
+- Zeroing the row tail changed "read a recycled block_id" into "read
+  block_id = 0" — **block 0 is the system-reserved block whose slot 0
+  is the FIRST request's prefix-cache slot**, so the affected token
+  was now reading ANOTHER request's actual prefix KV.  This turned the
+  18 % accuracy loss into a 6 % accuracy loss (worse) because the
+  foreign KV it picked up was *consistent enough* to bias the logits
+  away from the correct answer.
 
-1. **Primary**: the ascend-side `gpu_seq_len_patch` wraps
-   `AscendBlockTables.compute_slot_mappings` and clamps out-of-bounds
-   tokens to `PAD_SLOT_ID` using the per-req `num_blocks_per_row`.  See
-   `triattention/vllm_ascend/runtime/gpu_seq_len_patch.py`.
+The correct fix is therefore NOT to zero the row tail, but to wrap
+`compute_slot_mapping` (and `seq_lens` assembly) on the V1 path so the
+out-of-bounds tokens are mapped to `PAD_SLOT_ID` instead of an
+arbitrary block id.  That is implemented in
+`triattention/vllm_ascend/runtime/gpu_seq_len_patch.py` (v2 of the
+patch targets the actual hot path: the
+`vllm_ascend.worker.block_table.BlockTable.compute_slot_mapping` numpy
+implementation).  This module only does the SAFE subset:
 
-2. **Secondary (this module)**: when truncating the worker's block
-   table, also **zero the trailing block-id slots in the row** so the
-   kernel can never read a recycled block id, even if the primary patch
-   fails to install (e.g. on an older vllm-ascend build that doesn't
-   expose the wrap point).  We do this by:
+  1. Truncate `num_blocks_per_row[req_index]` to the post-reclaim block
+     count (so `append_row()` doesn't overflow the cap on the next
+     prefill chunk).
+  2. Truncate `req_state.block_ids` (the CPU-side per-request block-id
+     list) to the same count, so `_apply_compression_events` on the
+     next round sees the truncated list as the truth.
 
-   a. writing `0` (which maps to slot 0 of the unused-block table area;
-      the kernel treats this as a no-op slot) to the row entries from
-      `num_blocks_per_row` up to the *old* `num_blocks_per_row` value;
-   b. explicitly zeroing `block_table.np[row_idx, new_count:old_count]`
-      for both the CPU and (if already staged to GPU) the GPU tensor;
-   c. calling `commit_block_table(num_reqs)` so the GPU copy is fresh
-      before the next `compute_slot_mappings` kernel runs.
+We deliberately do **not** mutate `block_table.np` here.
 """
 
 from __future__ import annotations
@@ -93,17 +93,13 @@ def apply_worker_block_reclaim_events(
     v2_block_tables = getattr(base_runner, "block_tables", None)
     if block_table_obj is None and v2_block_tables is not None:
         # V2 path: hook-side compaction already updates the canonical
-        # tables; the secondary defense-in-depth zeroing is not needed
-        # here because the V2 BlockTable append API is the only path
-        # that mutates block_table.np, and the scheduler-side reclaim
-        # calls `apply_staged_writes` which propagates the truncation.
-        # Still, zero the trailing ids for safety on kernels that
-        # ignore num_blocks_per_row (Ascend's _compute_slot_mappings_kernel).
-        _zero_trailing_v2(
-            base_runner=base_runner,
-            events=events,
-            v2_block_tables=v2_block_tables,
-        )
+        # tables via the scheduler-side `_apply_compression_events`
+        # which mutates `req_to_blocks[req_id]` and calls
+        # `block_pool.free_blocks`.  No further worker-side truncation
+        # is needed here.  We deliberately do NOT zero the row tail —
+        # doing so on the vLLM-Ascend 0.18.0 path made things worse
+        # because `block_id = 0` is a real (system-reserved) block
+        # whose slot 0 belongs to a different request's prefix KV.
         return
     if block_table_obj is None:
         logger.warning(
@@ -164,25 +160,11 @@ def apply_worker_block_reclaim_events(
                 continue
             current = int(num_blocks_per_row[req_index])
             if current > required_blocks:
-                old_count = current
-                new_count = required_blocks
-                num_blocks_per_row[req_index] = new_count
-                # Defense in depth: zero the trailing block-id slots so
-                # the Ascend kernel cannot read a recycled block id for
-                # tokens whose `position // block_size` falls into the
-                # freed tail range.  The primary fix lives in
-                # `gpu_seq_len_patch` (PAD_SLOT_ID clamp); this is the
-                # belt-and-suspenders layer.
-                _zero_trailing_block_ids_in_row(
-                    table=table,
-                    row_idx=req_index,
-                    new_count=new_count,
-                    old_count=old_count,
-                )
+                num_blocks_per_row[req_index] = required_blocks
                 logger.info(
                     "TriAttention worker reclaim: req=%s num_blocks %d -> %d "
-                    "(cache_len_after=%d block_size=%d, trailing_ids_zeroed)",
-                    req_id, old_count, new_count, cache_len_after, block_size,
+                    "(cache_len_after=%d block_size=%d)",
+                    req_id, current, required_blocks, cache_len_after, block_size,
                 )
 
         # Also truncate req_state.block_ids (CPU-side block tracking).
@@ -196,117 +178,3 @@ def apply_worker_block_reclaim_events(
                     for group_blocks in block_ids_attr:
                         if isinstance(group_blocks, list) and len(group_blocks) > required_blocks:
                             del group_blocks[required_blocks:]
-
-
-def _zero_trailing_block_ids_in_row(
-    *,
-    table: Any,
-    row_idx: int,
-    new_count: int,
-    old_count: int,
-) -> None:
-    """Zero the trailing block-id slots in a single BlockTable row.
-
-    The BlockTable on the ascend side has both a CPU numpy buffer
-    (`block_table.np`) and an optional GPU copy (`block_table.gpu`);
-    the kernel reads from the GPU copy, so we must clear both to be
-    safe across staging modes.
-    """
-    if new_count >= old_count:
-        return
-    np_buffer = getattr(table, "block_table", None)
-    if np_buffer is None:
-        return
-    np_view = getattr(np_buffer, "np", None)
-    if np_view is not None and isinstance(np_view, np.ndarray):
-        try:
-            np_view[row_idx, new_count:old_count] = 0
-        except Exception:
-            logger.debug(
-                "TriAttention worker reclaim: failed to zero CPU trailing ids; "
-                "row_idx=%d new=%d old=%d",
-                row_idx, new_count, old_count, exc_info=True,
-            )
-    gpu_view = getattr(np_buffer, "gpu", None)
-    if gpu_view is not None:
-        try:
-            import torch  # local import; keep hot path lean
-            if hasattr(gpu_view, "__setitem__"):
-                gpu_view[row_idx, new_count:old_count] = 0
-            elif isinstance(gpu_view, torch.Tensor):
-                gpu_view[row_idx, new_count:old_count].zero_()
-        except Exception:
-            logger.debug(
-                "TriAttention worker reclaim: failed to zero GPU trailing ids; "
-                "row_idx=%d new=%d old=%d",
-                row_idx, new_count, old_count, exc_info=True,
-            )
-
-
-def _zero_trailing_v2(
-    *,
-    base_runner: Any,
-    events: list[dict[str, Any]] | None,
-    v2_block_tables: Any,
-) -> None:
-    """V2 path: zero trailing ids in the per-group BlockTable rows.
-
-    The V2 `MultiGroupBlockTable.append_block_ids(overwrite=True)` API
-    used by the scheduler-side reclaim already updates the row, but the
-    append API *extends* the row rather than truncating it, so any
-    previously freed block ids still sit in the tail.  We zero them
-    here so the Ascend kernel can never read recycled ids.
-    """
-    if not isinstance(events, list) or not events:
-        return
-    inner = getattr(v2_block_tables, "block_tables", None)
-    if not isinstance(inner, list):
-        return
-
-    cache_config = getattr(base_runner, "cache_config", None)
-    block_size = int(getattr(cache_config, "block_size", 16)) if cache_config else 16
-    if block_size <= 0:
-        block_size = 16
-
-    # Resolve req_index from input_batch.req_id_to_index (V2 still has one).
-    input_batch = getattr(base_runner, "input_batch", None)
-    req_id_to_index = getattr(input_batch, "req_id_to_index", None) if input_batch else None
-    if not isinstance(req_id_to_index, dict):
-        # Fallback: scan base_runner.requests if available
-        requests = getattr(base_runner, "requests", None)
-        if not isinstance(requests, dict):
-            return
-        req_id_to_index = {rid: idx for idx, (rid, _) in enumerate(requests.items())}
-    if not req_id_to_index:
-        return
-
-    for event in events:
-        if not isinstance(event, dict) or event.get("status") != "applied":
-            continue
-        req_id = event.get("req_id")
-        cache_len_after = event.get("cache_len_after")
-        if not isinstance(req_id, str) or not isinstance(cache_len_after, int) or cache_len_after <= 0:
-            continue
-        req_index = req_id_to_index.get(req_id)
-        if not isinstance(req_index, int):
-            continue
-        required_blocks = (cache_len_after + block_size - 1) // block_size
-        for table in inner:
-            num_blocks_per_row = getattr(table, "num_blocks_per_row", None)
-            if num_blocks_per_row is None or not isinstance(num_blocks_per_row, np.ndarray):
-                continue
-            current = int(num_blocks_per_row[req_index])
-            if current > required_blocks:
-                old_count = current
-                num_blocks_per_row[req_index] = required_blocks
-                _zero_trailing_block_ids_in_row(
-                    table=table,
-                    row_idx=req_index,
-                    new_count=required_blocks,
-                    old_count=old_count,
-                )
-                logger.info(
-                    "TriAttention worker reclaim (V2): req=%s num_blocks %d -> %d "
-                    "(trailing_ids_zeroed)",
-                    req_id, old_count, required_blocks,
-                )
