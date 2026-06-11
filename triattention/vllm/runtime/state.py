@@ -109,12 +109,16 @@ class RequestStateStore:
         state.compression_count += 1
         state.pending_triggers = max(state.pending_triggers - 1, 0)
         state.last_compression_step = step
-        # Include this step's scheduled decode tokens so that the next step's
-        # effective_base calculation accounts for the KV entries written by
-        # the compression step's own decode.  Without this, the next step
-        # computes the same effective slot as the compression step (off-by-1).
-        state.current_cache_len = cache_len + max(0, scheduled_tokens)
-        state.current_cache_len_semantics = "estimated_with_scheduled"
+        # `current_cache_len` MUST equal the post-compaction KV length, not
+        # `cache_len + scheduled_tokens`. The prefill+compress path passes
+        # scheduled_tokens=19789 (full prompt) and cache_len=2048 (post-
+        # compaction KV length); adding them gives 21837, which is greater
+        # than the next step's threshold and immediately re-triggers a
+        # second compression. The KV cache length is `cache_len`; the
+        # scheduler-side effective-length tracker separately accounts for
+        # scheduled decode tokens via its own observe_num_computed path.
+        state.current_cache_len = max(0, int(cache_len))
+        state.current_cache_len_semantics = "post_compaction"
         state.current_cache_len_step = int(step)
         state.last_absorbed_cache_len = max(0, int(cache_len))
         state.recent_unabsorbed_tokens = 0

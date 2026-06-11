@@ -36,7 +36,16 @@ def _resolve_estimated_effective_tokens(
             and isinstance(current_cache_len, int)
             and current_cache_len > 0
         ):
-            return max(0, int(current_cache_len))
+            # Defensive: a stale or wrong `current_cache_len` (e.g. the
+            # pre-fix state.py bug that wrote `cache_len + scheduled_tokens`)
+            # would balloon effective_tokens and trip the regression guard.
+            # If current_cache_len is implausibly large relative to
+            # `estimated_cache_len`, prefer the latter.
+            est_cache_len = int(getattr(signal, "estimated_cache_len", 0) or 0)
+            value = int(current_cache_len)
+            if est_cache_len > 0 and value > 2 * max(est_cache_len, 1):
+                return max(0, est_cache_len)
+            return max(0, value)
     return max(0, int(getattr(signal, "estimated_cache_len", 0)))
 
 

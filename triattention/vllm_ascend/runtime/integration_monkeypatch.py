@@ -246,9 +246,25 @@ def _patched_scheduler_update_from_output(self, scheduler_output, model_runner_o
             len(applied),
             source,
         )
-        TriAttentionAscendScheduler._apply_compression_events(
-            self, compression_events
-        )
+        try:
+            TriAttentionAscendScheduler._apply_compression_events(
+                self, compression_events
+            )
+        except Exception as _ev_exc:
+            # Previously this exception was silently swallowed by the
+            # framework, which left the scheduler's
+            # `_effective_len_tracker` permanently empty and caused the
+            # next scheduling round to re-fire on full num_computed_tokens.
+            import sys as _sys_ev
+            _sys_ev.stderr.write(
+                f"[TriAttention-Ascend][FATAL] _apply_compression_events "
+                f"raised exc={type(_ev_exc).__name__}: {str(_ev_exc)[:300]}\n"
+            )
+            _sys_ev.stderr.flush()
+            logger.exception(
+                "[TriAttention-Ascend] _apply_compression_events failed"
+            )
+            raise
 
     for req_id in scheduler_output.finished_req_ids:
         self._prefill_lens.pop(req_id, None)
