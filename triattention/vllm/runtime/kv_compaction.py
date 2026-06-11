@@ -25,6 +25,53 @@ def _debug_validate_compaction_content() -> bool:
     return os.environ.get("TRIATTN_DEBUG_VALIDATE_COMPACTION_CONTENT", "0") == "1"
 
 
+# --- INSTRUMENTATION (Level F2 helpers) ---
+# Compact-phase verbose dump gate. Shared across all compaction routines so
+# the "first call only" cap is process-global (per layer_idx).
+_F2_VERBOSE_DUMPED: set[tuple[str, int, str]] = set()
+_F2_VERBOSE_MAX = int(os.environ.get("TRIATTN_DEBUG_INSTRUMENT_VERBOSE_MAX", "8"))
+
+
+def _f2_verbose_allowed(req_id: str | None, layer_idx: int, mode: str) -> bool:
+    if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") != "1":
+        return False
+    if req_id is None:
+        key = ("__noreq__", int(layer_idx), str(mode))
+    else:
+        key = (str(req_id), int(layer_idx), str(mode))
+    if key in _F2_VERBOSE_DUMPED:
+        return False
+    if len(_F2_VERBOSE_DUMPED) >= _F2_VERBOSE_MAX:
+        return False
+    _F2_VERBOSE_DUMPED.add(key)
+    return True
+
+
+def _f2_short_index_list(t: torch.Tensor, n: int) -> str:
+    if not isinstance(t, torch.Tensor) or t.numel() == 0:
+        return "[]"
+    cpu = t.detach().to(device="cpu", dtype=torch.long).flatten()[:n]
+    return "[" + ",".join(str(int(x)) for x in cpu.tolist()) + (
+        f",...(+{int(t.numel()) - n})" if int(t.numel()) > n else ""
+    ) + "]"
+
+
+def _f2_block_id_range(
+    block_ids: list[int] | torch.Tensor,
+    src_blocks: torch.Tensor,
+) -> str:
+    if not isinstance(src_blocks, torch.Tensor) or src_blocks.numel() == 0:
+        return "n/a"
+    sb = src_blocks.detach().to(device="cpu", dtype=torch.long)
+    uniq = torch.unique(sb)
+    if uniq.numel() == 0:
+        return "n/a"
+    return (
+        f"min_bid={int(uniq.min().item())} max_bid={int(uniq.max().item())} "
+        f"n_unique={int(uniq.numel())} n_moves={int(sb.numel())}"
+    )
+
+
 def _kv_layout_hint_key(kv_cache: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...], str]:
     return (
         int(kv_cache.data_ptr()),
@@ -379,6 +426,8 @@ def compact_request_kv_in_place(
     total_tokens: int,
     preserve_dropped_tokens: bool = True,
     value_cache: torch.Tensor | None = None,
+    req_id: str | None = None,
+    layer_idx: int | None = None,
 ) -> int:
     """Compact KV for a single request in-place.
 
@@ -507,6 +556,41 @@ def compact_request_kv_in_place(
         if not torch.equal(actual_values, expected_values):
             raise RuntimeError("TRIATTN_DEBUG_COMPACTION_VALUE_MISMATCH:shared_prefix_content_mismatch")
 
+    # --- INSTRUMENTATION (Level F2 detailed dump, shared compact) ---
+    # Logs the actual src/dst token move plan. For "preserve_dropped=True"
+    # the perm is [kept..., dropped...] so the first keep_count rows of
+    # perm_tensor are the kept source token indices, and the remaining
+    # rows are the dropped source token indices being moved to the tail
+    # of the cache. For "fill_hole" path the perm is irregular — only the
+    # fill-hole placement is reported.
+    if _f2_verbose_allowed(req_id=req_id, layer_idx=int(layer_idx) if layer_idx is not None else -1, mode="shared"):
+        try:
+            import logging as _lg
+            # Compute keep set and drop set from perm_tensor layout.
+            if preserve_dropped_tokens and keep_count < total_tokens:
+                kept_src = perm_tensor[:keep_count]
+                dropped_src = perm_tensor[keep_count:]
+                drop_count = int(total_tokens) - int(keep_count)
+            else:
+                kept_src = keep_tensor
+                drop_count = 0
+                dropped_src = perm_tensor.new_empty(0, dtype=perm_tensor.dtype)
+            block_range = _f2_block_id_range(block_ids, src_blocks)
+            _lg.getLogger(__name__).info(
+                "[TRITN-INSTR] F2:compact_apply req=%s layer=%s mode=shared "
+                "total_tokens=%d keep_count=%d drop_count=%d "
+                "preserve_dropped=%s sample_kept_src=%s sample_dropped_src=%s "
+                "sample_dst_prefix=%s %s",
+                req_id, layer_idx, total_tokens, keep_count, drop_count,
+                preserve_dropped_tokens,
+                _f2_short_index_list(kept_src, 8),
+                _f2_short_index_list(dropped_src, 8),
+                _f2_short_index_list(dst_tokens, 8),
+                block_range,
+            )
+        except Exception:
+            pass
+
     return keep_count
 
 
@@ -518,6 +602,8 @@ def compact_request_kv_in_place_per_head(
     total_tokens: int,
     preserve_dropped_tokens: bool = True,
     value_cache: torch.Tensor | None = None,
+    req_id: str | None = None,
+    layer_idx: int | None = None,
 ) -> int:
     """Compact KV in-place using independent keep indices for each KV head.
 
@@ -569,6 +655,18 @@ def compact_request_kv_in_place_per_head(
         prefix = prefix.expand(num_kv_heads, -1)
         if torch.equal(keep_tensor, prefix):
             # Identity permutation for all heads, no copy needed.
+            if _f2_verbose_allowed(req_id=req_id, layer_idx=int(layer_idx) if layer_idx is not None else -1, mode="per_head_identity"):
+                try:
+                    import logging as _lg
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] F2:compact_apply req=%s layer=%s mode=per_head_identity "
+                        "total_tokens=%d keep_count=%d drop_count=%d "
+                        "note=keep_tensor==prefix for all heads, no copy",
+                        req_id, layer_idx, total_tokens, keep_count,
+                        int(total_tokens) - int(keep_count),
+                    )
+                except Exception:
+                    pass
             return keep_count
         all_tokens = torch.arange(total_tokens, device=device, dtype=torch.long).unsqueeze(0)
         all_tokens = all_tokens.expand(num_kv_heads, -1)
@@ -599,6 +697,37 @@ def compact_request_kv_in_place_per_head(
         )
         key_cache[dst_blocks, dst_off] = gathered_keys.permute(1, 0, 2).contiguous()
         value_cache[dst_blocks, dst_off] = gathered_values.permute(1, 0, 2).contiguous()
+
+        # --- INSTRUMENTATION (Level F2 detailed dump, per_head preserve_dropped) ---
+        if _f2_verbose_allowed(req_id=req_id, layer_idx=int(layer_idx) if layer_idx is not None else -1, mode="per_head"):
+            try:
+                import logging as _lg
+                # perm_tensor shape: [H, T]; first keep_count cols are kept src, rest are dropped src.
+                kept_src = perm_tensor[:, :keep_count]
+                dropped_src = perm_tensor[:, keep_count:]
+                sample_h = min(3, num_kv_heads)
+                sample_heads = (0, sample_h // 2, num_kv_heads - 1)
+                kept_dumps = []
+                drop_dumps = []
+                for h in sample_heads:
+                    if h < 0 or h >= num_kv_heads:
+                        continue
+                    kept_dumps.append(f"h{h}=" + _f2_short_index_list(kept_src[h], 6))
+                    drop_dumps.append(f"h{h}=" + _f2_short_index_list(dropped_src[h], 6))
+                block_range = _f2_block_id_range(block_ids, src_blocks)
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] F2:compact_apply req=%s layer=%s mode=per_head "
+                    "total_tokens=%d keep_count=%d drop_count=%d num_heads=%d "
+                    "sample_kept_src=[%s] sample_dropped_src=[%s] dst_prefix=%s %s",
+                    req_id, layer_idx, total_tokens, keep_count,
+                    int(total_tokens) - int(keep_count), num_kv_heads,
+                    " | ".join(kept_dumps),
+                    " | ".join(drop_dumps),
+                    _f2_short_index_list(dst_tokens, 8),
+                    block_range,
+                )
+            except Exception:
+                pass
 
         if _debug_validate_compaction_content() and keep_count > 0:
             prefix_tokens = torch.arange(keep_count, device=device, dtype=torch.long)
@@ -650,6 +779,33 @@ def compact_request_kv_in_place_per_head(
                 raise RuntimeError("TRIATTN_DEBUG_COMPACTION_KEY_MISMATCH:per_head_fill_hole_content_mismatch")
             if not torch.equal(actual_values, gathered_values):
                 raise RuntimeError("TRIATTN_DEBUG_COMPACTION_VALUE_MISMATCH:per_head_fill_hole_content_mismatch")
+
+        # --- INSTRUMENTATION (Level F2 detailed dump, per_head fill-hole) ---
+        if _f2_verbose_allowed(req_id=req_id, layer_idx=int(layer_idx) if layer_idx is not None else -1, mode="per_head_fill_hole"):
+            try:
+                import logging as _lg
+                sample_h = min(3, num_kv_heads)
+                sample_heads = (0, sample_h // 2, num_kv_heads - 1)
+                src_dumps = []
+                dst_dumps = []
+                for h in sample_heads:
+                    if h < 0 or h >= num_kv_heads:
+                        continue
+                    src_dumps.append(f"h{h}=" + _f2_short_index_list(src_tokens[h], 6))
+                    dst_dumps.append(f"h{h}=" + _f2_short_index_list(dst_tokens_flat[h], 6))
+                block_range = _f2_block_id_range(block_ids, src_blocks)
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] F2:compact_apply req=%s layer=%s mode=per_head_fill_hole "
+                    "total_tokens=%d keep_count=%d num_heads=%d n_moves=%d "
+                    "sample_src=[%s] sample_dst=[%s] %s",
+                    req_id, layer_idx, total_tokens, keep_count, num_kv_heads,
+                    int(src_tokens.numel()),
+                    " | ".join(src_dumps),
+                    " | ".join(dst_dumps),
+                    block_range,
+                )
+            except Exception:
+                pass
 
     return keep_count
 

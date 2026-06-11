@@ -146,6 +146,7 @@ def prepare_group_layer_compactions(
                     protect_prefill=protect_prefill,
                     round_start=round_start,
                     budget_total=group_budget_total,
+                    req_id=req_id,
                 )
             else:
 
@@ -179,6 +180,7 @@ def prepare_group_layer_compactions(
                     protect_prefill=protect_prefill,
                     round_start=round_start,
                     budget_total=group_budget_total,
+                    req_id=req_id,
                 )
         except Exception as exc:
             # Preserve the original TypeError message so future debugging on
@@ -227,6 +229,7 @@ def prepare_group_layer_compactions(
                         layer_idx=layer_idx,
                         round_start=round_start,
                         budget_total=group_budget_total,
+                        req_id=req_id,
                     )
                 else:
                     keys_dense = gather_dense(
@@ -243,6 +246,7 @@ def prepare_group_layer_compactions(
                         layer_idx=layer_idx,
                         round_start=round_start,
                         budget_total=group_budget_total,
+                        req_id=req_id,
                     )
             except Exception as exc:
                 raise RuntimeError(

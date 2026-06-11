@@ -23,6 +23,40 @@ from .kv_allocation_sync import (
 )
 from .planner import CompressionPlanner
 from .request_key_compat import iter_scheduled_token_items
+
+# --- INSTRUMENTATION (Level G2 helpers) ---
+# Reclaim-phase verbose dump gate. First-call only per (req_id, gid).
+_G2_VERBOSE_DUMPED: set[tuple[str, int]] = set()
+_G2_VERBOSE_MAX = int(os.environ.get("TRIATTN_DEBUG_INSTRUMENT_VERBOSE_MAX", "8"))
+
+
+def _g2_verbose_allowed(req_id: str | None, gid: int) -> bool:
+    if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") != "1":
+        return False
+    if req_id is None:
+        key = ("__noreq__", int(gid))
+    else:
+        key = (str(req_id), int(gid))
+    if key in _G2_VERBOSE_DUMPED:
+        return False
+    if len(_G2_VERBOSE_DUMPED) >= _G2_VERBOSE_MAX:
+        return False
+    _G2_VERBOSE_DUMPED.add(key)
+    return True
+
+
+def _g2_short_list(values: list[int], n: int) -> str:
+    if not values:
+        return "[]"
+    sample = values[:n]
+    more = f",...(+{len(values) - n})" if len(values) > n else ""
+    return (
+        "["
+        + ",".join(str(int(x)) for x in sample)
+        + "]"
+        + f" (n={len(values)}, min={min(values)}, max={max(values)})"
+        + more
+    )
 from .signals import CompressionSignal
 
 logger = init_logger(__name__)
@@ -594,6 +628,19 @@ class TriAttentionScheduler(Scheduler):
                             )
                         except Exception:
                             pass
+                    # --- INSTRUMENTATION (Level G2 detailed dump, actual block_ids) ---
+                    if _g2_verbose_allowed(req_id=req_id, gid=gid):
+                        try:
+                            logger.info(
+                                "[TRITN-INSTR] G2:reclaim_block_diff req=%s gid=%d "
+                                "freed_block_ids=%s kept_block_ids=%s new_block_ids=%s",
+                                req_id, gid,
+                                _g2_short_list([int(b.block_id) for b in removed_old_blocks], 32),
+                                _g2_short_list([int(b.block_id) for b in kept_old_blocks], 32),
+                                _g2_short_list([int(b.block_id) for b in new_blocks_this_step], 32),
+                            )
+                        except Exception:
+                            pass
                     if _free_reclaimed_blocks(manager, removed_old_blocks):
                         reclaim_applied_any = True
 
@@ -617,6 +664,18 @@ class TriAttentionScheduler(Scheduler):
                             manager.num_cached_block[req_id],
                             len(kept_blocks),
                         )
+                    # --- INSTRUMENTATION (Level G2 detailed dump, synthesized) ---
+                    if _g2_verbose_allowed(req_id=req_id, gid=gid):
+                        try:
+                            logger.info(
+                                "[TRITN-INSTR] G2:reclaim_block_diff req=%s gid=%d "
+                                "freed_block_ids=%s kept_block_ids=%s note=synthesized",
+                                req_id, gid,
+                                _g2_short_list([int(b.block_id) for b in removed_blocks], 32),
+                                _g2_short_list([int(b.block_id) for b in kept_blocks], 32),
+                            )
+                        except Exception:
+                            pass
                     if _free_reclaimed_blocks(manager, removed_blocks):
                         reclaim_applied_any = True
             elif missing_gids and _evt_scheduled > 1:

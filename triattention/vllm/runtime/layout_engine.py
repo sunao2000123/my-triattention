@@ -69,6 +69,8 @@ def compact_layer_with_keep_plan(
     shared_compact_fn: Any | None = None,
     per_head_compact_fn: Any | None = None,
     value_cache: torch.Tensor | None = None,
+    req_id: str | None = None,
+    layer_idx: int | None = None,
 ) -> LayerCompactionResult:
     keep_count = keep_plan.keep_count()
     before_required = num_required_blocks(total_tokens, block_size)
@@ -94,6 +96,8 @@ def compact_layer_with_keep_plan(
             total_tokens=total_tokens,
             preserve_dropped_tokens=preserve_dropped_tokens,
             value_cache=value_cache,
+            req_id=req_id,
+            layer_idx=layer_idx,
         )
     else:
         shared_fn = shared_compact_fn or compact_request_kv_in_place
@@ -105,6 +109,8 @@ def compact_layer_with_keep_plan(
             total_tokens=total_tokens,
             preserve_dropped_tokens=preserve_dropped_tokens,
             value_cache=value_cache,
+            req_id=req_id,
+            layer_idx=layer_idx,
         )
 
     return LayerCompactionResult(
@@ -124,6 +130,7 @@ def compact_prepared_group_layers(
     enable_experimental_block_reclaim: bool,
     shared_compact_fn: Any | None = None,
     per_head_compact_fn: Any | None = None,
+    req_id: str | None = None,
 ) -> list[tuple[int, LayerCompactionResult]]:
     """Apply compaction for all prepared layers in one group.
 
@@ -141,6 +148,8 @@ def compact_prepared_group_layers(
             shared_compact_fn=shared_compact_fn,
             per_head_compact_fn=per_head_compact_fn,
             value_cache=task.value_cache,
+            req_id=req_id,
+            layer_idx=int(task.layer_idx),
         )
         results.append((task.layer_idx, result))
     return results
@@ -167,6 +176,7 @@ def execute_group_compaction(
         enable_experimental_block_reclaim=enable_experimental_block_reclaim,
         shared_compact_fn=shared_compact_fn,
         per_head_compact_fn=per_head_compact_fn,
+        req_id=req_id,
     )
 
     cache_len_after: int | None = None

@@ -12,6 +12,103 @@ from .config import TriAttentionRuntimeConfig
 from .constants import TRITON_SCORING_REQUIRED_MARKER
 from .kv_compaction import gather_request_k_dense_range
 
+# --- INSTRUMENTATION (Level H helpers) ---
+# Module-level state for "first call only" throttling. The selector is called
+# once per (req, layer) per compression, so even with verbose dump the per-step
+# cost is bounded; we still cap the *detailed* log emission to the first few
+# (req_id, layer) tuples the selector sees in this process, to avoid log flood
+# during long generations.  The user can override the cap with
+# TRIATTN_DEBUG_INSTRUMENT_VERBOSE_MAX.
+_INSTR_VERBOSE_MAX = int(os.environ.get("TRIATTN_DEBUG_INSTRUMENT_VERBOSE_MAX", "8"))
+_INSTR_VERBOSE_DUMPED: set[tuple[str, int]] = set()
+
+
+def _instr_verbose_allowed(req_id: str | None, layer_idx: int) -> bool:
+    """Return True at most ``_INSTR_VERBOSE_MAX`` times per (req_id, layer).
+
+    Gated by ``TRIATTN_DEBUG_INSTRUMENT=1``. The first ``_INSTR_VERBOSE_MAX``
+    distinct (req_id, layer) pairs emit a Level H detailed dump; subsequent
+    pairs emit only a one-line summary.  This is the "first call only" gate
+    requested by the user: each (request, layer) gets one full dump, then we
+    stop.  ``req_id`` may be None (closure-built selector) in which case we
+    fall back to a global counter.
+    """
+    if os.environ.get("TRIATTN_DEBUG_INSTRUMENT", "0") != "1":
+        return False
+    if req_id is None:
+        # No req_id context: dump the first _INSTR_VERBOSE_MAX times total.
+        key = ("__noreq__", layer_idx)
+    else:
+        key = (str(req_id), int(layer_idx))
+    if key in _INSTR_VERBOSE_DUMPED:
+        return False
+    if len(_INSTR_VERBOSE_DUMPED) >= _INSTR_VERBOSE_MAX:
+        return False
+    _INSTR_VERBOSE_DUMPED.add(key)
+    return True
+
+
+def _format_index_sample(
+    indices: torch.Tensor,
+    *,
+    head_count: int,
+    sample_heads: tuple[int, ...],
+    max_indices: int,
+) -> str:
+    """Compact dump of a [H, K] keep-index tensor.
+
+    For each sampled head, prints the first ``max_indices`` kept token
+    positions plus a few summary stats (min/max/mean/std).  Keeps log
+    line short even when K is large.
+    """
+    if not isinstance(indices, torch.Tensor) or indices.numel() == 0:
+        return f"empty(shape={tuple(indices.shape) if isinstance(indices, torch.Tensor) else None})"
+    parts: list[str] = []
+    for h in sample_heads:
+        if h < 0 or h >= head_count:
+            continue
+        row = indices[h]
+        if row.numel() == 0:
+            parts.append(f"h{h}=[]")
+            continue
+        row_cpu = row.detach().to(device="cpu", dtype=torch.long)
+        n = int(row_cpu.numel())
+        k = min(max_indices, n)
+        head_vals = row_cpu[:k].tolist()
+        stats = (
+            f"min={int(row_cpu.min().item())} "
+            f"max={int(row_cpu.max().item())} "
+            f"mean={float(row_cpu.float().mean().item()):.1f} "
+            f"std={float(row_cpu.float().std(unbiased=False).item()):.1f}"
+        )
+        more = f"...(+{n - k})" if n > k else ""
+        parts.append(f"h{h}=[{','.join(str(int(x)) for x in head_vals)}{more}] {stats}")
+    return " | ".join(parts)
+
+
+def _format_score_quantiles(scores: torch.Tensor) -> str:
+    """Per-head score quantiles for the dynamic (non-pinned) region.
+
+    Returns a short string: ``p50=X p90=X p99=X max=X`` averaged over heads.
+    """
+    if not isinstance(scores, torch.Tensor) or scores.numel() == 0:
+        return "no_scores"
+    flat = scores.detach().to(dtype=torch.float32, device="cpu").flatten()
+    if flat.numel() == 0:
+        return "no_scores"
+    # Use torch.quantile (sync, but tiny — only fires when verbose-gated).
+    try:
+        qs = torch.tensor([0.5, 0.9, 0.99, 1.0], dtype=torch.float32)
+        q = torch.quantile(flat, qs)
+        return (
+            f"p50={float(q[0]):.3f} p90={float(q[1]):.3f} "
+            f"p99={float(q[2]):.3f} max={float(q[3]):.3f} "
+            f"min={float(flat.min().item()):.3f} mean={float(flat.mean().item()):.3f}"
+        )
+    except Exception:
+        return f"min={float(flat.min().item()):.3f} max={float(flat.max().item()):.3f}"
+
+
 def build_triattention_selector(
     config: TriAttentionRuntimeConfig,
     base_runner: Any | None = None,
@@ -783,8 +880,71 @@ def build_triattention_selector(
             return {"mode": "shared", "indices": []}
         if wants_per_head and best_indices.ndim == 2:
             keep_per_head = torch.sort(best_indices, dim=-1).values.contiguous()
+            # --- INSTRUMENTATION (Level H return) ---
+            # Dump the actual per-head topk indices for this layer so we can
+            # see *which* token positions were chosen. Gated by
+            # TRIATTN_DEBUG_INSTRUMENT=1 and a "first N (req,layer) pairs"
+            # cap so this fires for the first few selections only.
+            if _instr_verbose_allowed(req_id=None, layer_idx=layer_idx):
+                try:
+                    import logging as _lg
+                    runtime_h = int(kv_cache.shape[2]) if kv_cache.ndim == 4 else int(kv_cache.shape[3])
+                    sample_heads = tuple(
+                        sorted({0, runtime_h // 2, runtime_h - 1})
+                    )
+                    prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                    window_count = _resolve_effective_recent_count(total_tokens)
+                    tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                    dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                    keep_dyn_actual = max(0, int(keep_per_head.shape[-1]) - prefill_pinned - tail_pinned)
+                    indices_dump = _format_index_sample(
+                        keep_per_head,
+                        head_count=runtime_h,
+                        sample_heads=sample_heads,
+                        max_indices=12,
+                    )
+                    # Score quantiles over the *best* scores tensor (topk scores,
+                    # already aggregated across chunks). This tells us the
+                    # dynamic-region score distribution the selector saw.
+                    score_q = _format_score_quantiles(best_scores if best_scores is not None else keep_per_head)
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] H:selector_topk_inside layer=%d mode=paged_per_head "
+                        "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                        "dynamic_total=%d keep_per_head=%d keep_dyn_actual=%d "
+                        "score_q=[%s] sample_keep=[%s]",
+                        layer_idx, total_tokens, k,
+                        prefill_pinned, tail_pinned, dynamic_total,
+                        int(keep_per_head.shape[-1]), keep_dyn_actual,
+                        score_q, indices_dump,
+                    )
+                except Exception:
+                    pass
             return {"mode": "per_head", "indices": keep_per_head}
         keep = torch.sort(best_indices, dim=-1).values.contiguous()
+        if _instr_verbose_allowed(req_id=None, layer_idx=layer_idx):
+            try:
+                import logging as _lg
+                prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                window_count = _resolve_effective_recent_count(total_tokens)
+                tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                indices_dump = _format_index_sample(
+                    keep.unsqueeze(0) if keep.ndim == 1 else keep,
+                    head_count=1,
+                    sample_heads=(0,),
+                    max_indices=16,
+                )
+                score_q = _format_score_quantiles(best_scores)
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] H:selector_topk_inside layer=%d mode=paged_shared "
+                    "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                    "dynamic_total=%d keep_count=%d score_q=[%s] sample_keep=[%s]",
+                    layer_idx, total_tokens, k,
+                    prefill_pinned, tail_pinned, dynamic_total,
+                    int(keep.numel()), score_q, indices_dump,
+                )
+            except Exception:
+                pass
         return {"mode": "shared", "indices": keep}
 
     def _select_keep_indices(
@@ -799,6 +959,7 @@ def build_triattention_selector(
         layer_idx: int,
         round_start: int,
         budget_total: int,
+        req_id: str | None = None,
     ) -> dict[str, Any] | None:
         # --- INSTRUMENTATION (Level E entry) ---
         # Per-layer selector entry. Logs the key parameters used to
@@ -873,6 +1034,36 @@ def build_triattention_selector(
                     )
                 except Exception:
                     pass
+            # --- INSTRUMENTATION (Level H detailed dump, dense per-head) ---
+            if _instr_verbose_allowed(req_id=req_id, layer_idx=layer_idx):
+                try:
+                    import logging as _lg
+                    runtime_h = int(scores.shape[1]) if scores.ndim >= 2 else 1
+                    sample_heads = tuple(sorted({0, runtime_h // 2, runtime_h - 1}))
+                    prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                    window_count = _resolve_effective_recent_count(total_tokens)
+                    tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                    dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                    keep_dyn_actual = max(0, int(keep_per_head.shape[-1]) - prefill_pinned - tail_pinned)
+                    indices_dump = _format_index_sample(
+                        keep_per_head,
+                        head_count=runtime_h,
+                        sample_heads=sample_heads,
+                        max_indices=12,
+                    )
+                    score_q = _format_score_quantiles(scores)
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] H:selector_topk_inside layer=%d req=%s mode=dense_per_head "
+                        "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                        "dynamic_total=%d keep_per_head=%d keep_dyn_actual=%d "
+                        "score_q=[%s] sample_keep=[%s]",
+                        layer_idx, req_id, total_tokens, k,
+                        prefill_pinned, tail_pinned, dynamic_total,
+                        int(keep_per_head.shape[-1]), keep_dyn_actual,
+                        score_q, indices_dump,
+                    )
+                except Exception:
+                    pass
             return {"mode": "per_head", "indices": keep_per_head}
 
         scores_agg = scores
@@ -896,6 +1087,31 @@ def build_triattention_selector(
                 )
             except Exception:
                 pass
+        # --- INSTRUMENTATION (Level H detailed dump, dense shared) ---
+        if _instr_verbose_allowed(req_id=req_id, layer_idx=layer_idx):
+            try:
+                import logging as _lg
+                prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                window_count = _resolve_effective_recent_count(total_tokens)
+                tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                indices_dump = _format_index_sample(
+                    keep.unsqueeze(0) if keep.ndim == 1 else keep,
+                    head_count=1,
+                    sample_heads=(0,),
+                    max_indices=16,
+                )
+                score_q = _format_score_quantiles(scores_agg)
+                _lg.getLogger(__name__).info(
+                    "[TRITN-INSTR] H:selector_topk_inside layer=%d req=%s mode=dense_shared "
+                    "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                    "dynamic_total=%d keep_count=%d score_q=[%s] sample_keep=[%s]",
+                    layer_idx, req_id, total_tokens, k,
+                    prefill_pinned, tail_pinned, dynamic_total,
+                    int(keep.numel()), score_q, indices_dump,
+                )
+            except Exception:
+                pass
         return {"mode": "shared", "indices": keep}
 
     def _select_keep_indices_for_group_per_head(
@@ -912,6 +1128,7 @@ def build_triattention_selector(
         protect_prefill: bool,
         round_start: int,
         budget_total: int,
+        req_id: str | None = None,
     ) -> dict[str, Any] | None:
         if requested_pruning_mode != "per_head":
             return None
@@ -1176,6 +1393,40 @@ def build_triattention_selector(
             if best_indices is None:
                 return None
             keep_per_head = torch.sort(best_indices, dim=-1).values.contiguous()
+            # --- INSTRUMENTATION (Level H detailed dump, group per-head paged) ---
+            _emit_group_dump = _instr_verbose_allowed(
+                req_id=req_id, layer_idx=-1
+            )
+            if _emit_group_dump:
+                try:
+                    import logging as _lg
+                    runtime_h = int(keep_per_head.shape[0]) if keep_per_head.ndim >= 1 else 1
+                    sample_heads = tuple(sorted({0, runtime_h // 2, runtime_h - 1}))
+                    prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                    window_count = _resolve_effective_recent_count(total_tokens)
+                    tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                    dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                    keep_dyn_actual = max(0, int(keep_per_head.shape[-1]) - prefill_pinned - tail_pinned)
+                    indices_dump = _format_index_sample(
+                        keep_per_head,
+                        head_count=runtime_h,
+                        sample_heads=sample_heads,
+                        max_indices=12,
+                    )
+                    score_q = _format_score_quantiles(best_scores if best_scores is not None else keep_per_head)
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] H:selector_topk_inside layer=GROUP req=%s mode=group_paged_per_head "
+                        "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                        "dynamic_total=%d keep_per_head=%d keep_dyn_actual=%d "
+                        "agg_mode=%s group_layers=%s score_q=[%s] sample_keep=[%s]",
+                        req_id, total_tokens, k,
+                        prefill_pinned, tail_pinned, dynamic_total,
+                        int(keep_per_head.shape[-1]), keep_dyn_actual,
+                        group_agg_mode, list(prepared_layer_indices)[:8],
+                        score_q, indices_dump,
+                    )
+                except Exception:
+                    pass
             return {
                 "mode": "per_head",
                 "indices": keep_per_head,
@@ -1222,6 +1473,37 @@ def build_triattention_selector(
                 sorted=False,
             ).indices
             keep_per_head = torch.sort(topk, dim=-1).values.contiguous()
+            # --- INSTRUMENTATION (Level H detailed dump, group per-head dense) ---
+            if _instr_verbose_allowed(req_id=req_id, layer_idx=-1):
+                try:
+                    import logging as _lg
+                    runtime_h = int(keep_per_head.shape[0]) if keep_per_head.ndim >= 1 else 1
+                    sample_heads = tuple(sorted({0, runtime_h // 2, runtime_h - 1}))
+                    prefill_pinned = max(0, int(prefill_len)) if protect_prefill else 0
+                    window_count = _resolve_effective_recent_count(total_tokens)
+                    tail_pinned = min(int(window_count), max(0, int(total_tokens) - prefill_pinned))
+                    dynamic_total = max(0, int(total_tokens) - prefill_pinned - tail_pinned)
+                    keep_dyn_actual = max(0, int(keep_per_head.shape[-1]) - prefill_pinned - tail_pinned)
+                    indices_dump = _format_index_sample(
+                        keep_per_head,
+                        head_count=runtime_h,
+                        sample_heads=sample_heads,
+                        max_indices=12,
+                    )
+                    score_q = _format_score_quantiles(aggregated_scores)
+                    _lg.getLogger(__name__).info(
+                        "[TRITN-INSTR] H:selector_topk_inside layer=GROUP req=%s mode=group_dense_per_head "
+                        "total_tokens=%d budget=%d prefill_pinned=%d tail_pinned=%d "
+                        "dynamic_total=%d keep_per_head=%d keep_dyn_actual=%d "
+                        "agg_mode=mean group_layers=%s score_q=[%s] sample_keep=[%s]",
+                        req_id, total_tokens, k,
+                        prefill_pinned, tail_pinned, dynamic_total,
+                        int(keep_per_head.shape[-1]), keep_dyn_actual,
+                        list(dense_layer_indices)[:8],
+                        score_q, indices_dump,
+                    )
+                except Exception:
+                    pass
             return {
                 "mode": "per_head",
                 "indices": keep_per_head,
