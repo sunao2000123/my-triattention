@@ -670,12 +670,40 @@ def build_triattention_selector(
         # masked_fill is a no-op when guard_mask has no true elements.
         return scores.masked_fill(guard_mask.view(1, 1, -1), float("inf"))
 
+    _NPU_CHUNK_FLOOR = 16384
+    _is_npu_device: bool | None = None
+
+    def _detect_npu_device() -> bool:
+        nonlocal _is_npu_device
+        if _is_npu_device is not None:
+            return _is_npu_device
+        try:
+            _dev = effective_device
+            _is_npu_device = (
+                (isinstance(_dev, torch.device) and _dev.type == "npu")
+                or (isinstance(_dev, str) and _dev.strip() == "npu")
+            )
+        except Exception:
+            _is_npu_device = False
+        return _is_npu_device
+
     def _score_chunk_tokens(block_size: int, total_tokens: int) -> int:
         upper = max(block_size, int(config.score_chunk_max_tokens))
         # Small/medium effective lengths do not need chunking; avoiding chunk splits
         # reduces Python loop overhead and kernel launches in the hot scoring path.
         if total_tokens <= upper:
             return max(block_size, total_tokens)
+        # Ascend NPU optimization: each chunk below ~16k pays a fixed
+        # kernel-launch + host-sync cost that dominates wall time on NPU
+        # because each torch.topk / masked_fill / scatter_ launches an
+        # aclnn op and the launch path is ~5x slower than CUDA. Bump the
+        # chunk ceiling to 16k on NPU when the full sequence is at
+        # least 16k, so a 20k cache splits into 2 chunks instead of 5
+        # (saves ~7 kernel launches per layer x 36 layers = ~10s of
+        # launch overhead avoided on a typical 36-layer 20k-token
+        # compression).
+        if _detect_npu_device() and total_tokens >= _NPU_CHUNK_FLOOR:
+            return _NPU_CHUNK_FLOOR
         return upper
 
     def _select_keep_indices_paged_streaming(
