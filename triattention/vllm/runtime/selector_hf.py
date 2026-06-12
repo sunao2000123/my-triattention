@@ -622,6 +622,14 @@ def build_triattention_selector(
             protect_prefill=protect_prefill,
         )
 
+    # Process-local cache for `_build_token_guard_mask` outputs. The
+    # selector hot path builds the same bool mask once per chunk per
+    # layer; on NPU each `torch.arange` + `torch.zeros_like` + bool OR
+    # pays an aclnn launch, and the cached mask is read-only downstream.
+    # Keyed on the only parameters that change per build call.
+    _guard_mask_cache: dict[tuple, torch.Tensor] = {}
+    _GUARD_MASK_CACHE_MAX = 8
+
     def _build_token_guard_mask(
         *,
         start_token: int,
@@ -633,6 +641,24 @@ def build_triattention_selector(
     ) -> torch.Tensor | None:
         if config.window_size <= 0 and not (protect_prefill and prefill_len > 0):
             return None
+        # Cache key includes start_token because the chunked loop calls
+        # this with non-zero start_token for chunks 1..N-1.
+        cache_key = (
+            int(start_token),
+            int(num_tokens),
+            int(total_tokens),
+            int(prefill_len),
+            int(config.window_size),
+            bool(protect_prefill),
+            (
+                device.index
+                if isinstance(device, torch.device)
+                else -1
+            ),
+        )
+        cached = _guard_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
         token_positions = torch.arange(
             start_token,
             start_token + num_tokens,
@@ -646,6 +672,9 @@ def build_triattention_selector(
             guard_mask |= token_positions >= window_start
         if protect_prefill and prefill_len > 0:
             guard_mask |= token_positions < prefill_len
+        if len(_guard_mask_cache) >= _GUARD_MASK_CACHE_MAX:
+            _guard_mask_cache.pop(next(iter(_guard_mask_cache)))
+        _guard_mask_cache[cache_key] = guard_mask
         return guard_mask
 
     def _apply_token_guards(

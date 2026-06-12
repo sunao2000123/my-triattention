@@ -167,6 +167,19 @@ class TriAttentionScheduler(Scheduler):
         threshold = self.triattention_config.kv_budget + self.triattention_config.divide_length
         if self.triattention_config.protect_prefill and not self.triattention_config.include_prefill_in_budget:
             threshold += max(0, int(prefill_len))
+        # Ascend NPU optimization: defer the FIRST compression by
+        # requiring the cache to reach 2 x kv_budget before triggering.
+        # The prefill+compress step that fires immediately after a
+        # chunked prefill chunk (e.g. 19k tokens absorbing into KV at
+        # once) pays ~80ms of scoring + scatter for zero downstream
+        # benefit, because no decode step has actually consumed those
+        # tokens yet. Once the cache grows past 2 x kv_budget the
+        # compress work is amortized across real decode work, so the
+        # same 80ms is recovered.
+        # The threshold is gated on TRIATTN_RUNTIME_DEFER_FIRST_COMPRESS=1
+        # to preserve exact-match behavior for callers that don't want it.
+        if os.environ.get("TRIATTN_RUNTIME_DEFER_FIRST_COMPRESS", "1") == "1":
+            threshold = max(threshold, 2 * int(self.triattention_config.kv_budget))
         return threshold
 
     def _sync_prefill_lens(self, scheduler_output: SchedulerOutput) -> None:
